@@ -61,6 +61,17 @@ const ACTION_COLORS: Record<Action['status'], string> = {
 /** Long text arguments (file contents, replacements) shown as their own blocks. */
 const TEXT_ARGUMENTS = ['content', 'old_string', 'new_string', 'command', 'body'];
 
+/** Panel responses are one long JSON line; indent them so they wrap readably. */
+function readable(output: string): string {
+  try {
+    return JSON.stringify(JSON.parse(output), null, 2);
+  } catch {
+    return output;
+  }
+}
+
+const OUTPUT_CLASS = 'max-h-80 overflow-auto whitespace-pre-wrap break-words';
+
 function ActionArguments({ value }: { value: unknown }) {
   if (!value || typeof value !== 'object' || Array.isArray(value)) {
     return <Code block>{JSON.stringify(value, null, 2)}</Code>;
@@ -77,7 +88,7 @@ function ActionArguments({ value }: { value: unknown }) {
           <Text size='xs' c='dimmed'>
             {key}
           </Text>
-          <Code block className='max-h-64 overflow-auto'>
+          <Code block className={OUTPUT_CLASS}>
             {String(item)}
           </Code>
         </div>
@@ -124,8 +135,8 @@ function ActionCard({
         </Text>
         <ActionArguments value={action.arguments} />
         {action.result && action.status !== 'pending' && (
-          <Code block className='max-h-64 overflow-auto'>
-            {action.result}
+          <Code block className={OUTPUT_CLASS}>
+            {readable(action.result)}
           </Code>
         )}
         {action.status === 'pending' && (
@@ -186,8 +197,8 @@ function ToolCallItem({ view, title }: { view: Exclude<CallView, { kind: 'action
         {view.isError ? tExt('tool.failed', { title }) : tExt('tool.done', { title })}
       </Button>
       {open && (
-        <Code block className='mt-1 max-h-80 overflow-auto'>
-          {view.content}
+        <Code block className={`mt-1 ${OUTPUT_CLASS}`}>
+          {readable(view.content)}
         </Code>
       )}
     </div>
