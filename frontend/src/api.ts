@@ -17,15 +17,25 @@ export interface ToolInfo {
   confirm: boolean;
 }
 
+export type UserKeyMode = 'off' | 'allowed' | 'required';
+
 export interface ChatInfo {
   enabled: boolean;
   configured: boolean;
   problem: string | null;
-  provider: 'openai' | 'anthropic';
   model: string;
   tools: ToolInfo[];
+  access: {
+    mode: UserKeyMode;
+    /** Whose key pays: the panel's or the user's own. */
+    source: 'panel' | 'user' | null;
+    needs_user_key: boolean;
+    has_user_key: boolean;
+  };
   usage: {
+    /** Tokens on the panel's key today; only these count against the daily limit. */
     tokens_today: number;
+    own_key_tokens_today: number;
     daily_token_limit: number;
     requests_per_hour: number;
   };
@@ -60,6 +70,13 @@ export const createConversation = async (base: string): Promise<Conversation> =>
 
 export const getConversation = async (base: string, uuid: string): Promise<ConversationDetail> =>
   (await axiosInstance.get(`${base}/conversations/${uuid}`)).data;
+
+export const renameConversation = async (base: string, uuid: string, title: string): Promise<Conversation> =>
+  (await axiosInstance.patch(`${base}/conversations/${uuid}`, { title })).data.conversation;
+
+export const stopTurn = async (base: string, uuid: string): Promise<void> => {
+  await axiosInstance.post(`${base}/conversations/${uuid}/stop`, {});
+};
 
 export const deleteConversation = async (base: string, uuid: string): Promise<void> => {
   await axiosInstance.delete(`${base}/conversations/${uuid}`);
@@ -147,6 +164,8 @@ export const settingsSchema = z.object({
   historyLimit: z.number(),
   retentionDays: z.number(),
   instructions: z.string(),
+  userKeys: z.enum(['off', 'allowed', 'required']),
+  allowCustomBaseUrls: z.boolean(),
 });
 export type Settings = z.infer<typeof settingsSchema>;
 
@@ -175,3 +194,49 @@ export interface ConnectionTest {
 
 export const testSettings = async (): Promise<ConnectionTest> =>
   (await axiosInstance.post(`${ADMIN_BASE}/settings/test`, {})).data;
+
+// A user's own provider key. The key itself never comes back; only whether one is stored and
+// its last characters.
+
+export const USER_KEY_BASE = `/api/client/extensions/${PACKAGE}/key`;
+
+export interface Preset {
+  id: string;
+  name: string;
+  kind: 'openai' | 'anthropic';
+  base_url: string;
+  default_model: string;
+}
+
+export interface StoredUserKey {
+  preset: string;
+  base_url: string | null;
+  model: string;
+  api_key: { set: boolean; hint: string | null };
+  updated: string;
+}
+
+export interface UserKeyState {
+  mode: UserKeyMode;
+  allow_custom_base_urls: boolean;
+  presets: Preset[];
+  key: StoredUserKey | null;
+}
+
+export interface UserKeyUpdate {
+  preset: string;
+  base_url?: string;
+  model: string;
+  /** Left out keeps the stored key. */
+  api_key?: string;
+}
+
+export const getUserKey = async (): Promise<UserKeyState> => (await axiosInstance.get(USER_KEY_BASE)).data;
+
+export const saveUserKey = async (update: UserKeyUpdate): Promise<UserKeyState> =>
+  (await axiosInstance.put(USER_KEY_BASE, update)).data;
+
+export const deleteUserKey = async (): Promise<UserKeyState> => (await axiosInstance.delete(USER_KEY_BASE)).data;
+
+export const testUserKey = async (): Promise<ConnectionTest> =>
+  (await axiosInstance.post(`${USER_KEY_BASE}/test`, {})).data;

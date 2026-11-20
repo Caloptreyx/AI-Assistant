@@ -44,6 +44,8 @@ export interface ChatState {
   /** A turn is streaming. */
   busy: boolean;
   error: string | null;
+  /** The user stopped the last turn. */
+  stopped: boolean;
 }
 
 export const emptyChat: ChatState = {
@@ -53,6 +55,7 @@ export const emptyChat: ChatState = {
   running: [],
   busy: false,
   error: null,
+  stopped: false,
 };
 
 export function loadedChat(messages: Message[], actions: Action[]): ChatState {
@@ -108,6 +111,8 @@ export function applyEvent(state: ChatState, message: SseMessage): ChatState {
     }
     case 'error':
       return { ...state, error: String(data.message ?? 'Unknown error') };
+    case 'stopped':
+      return { ...state, stopped: true };
     case 'done':
       return { ...state, busy: false, draft: '', running: [] };
     default:

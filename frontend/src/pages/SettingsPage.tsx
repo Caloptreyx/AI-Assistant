@@ -1,4 +1,4 @@
-import { faGauge, faKey, faMessage, faRobot, faToggleOn } from '@fortawesome/free-solid-svg-icons';
+import { faGauge, faKey, faMessage, faRobot, faToggleOn, faUserShield } from '@fortawesome/free-solid-svg-icons';
 import { FontAwesomeIcon } from '@fortawesome/react-fontawesome';
 import { SimpleGrid } from '@mantine/core';
 import { useQuery, useQueryClient } from '@tanstack/react-query';
@@ -17,6 +17,7 @@ import Switch from '@/elements/input/Switch.tsx';
 import TextArea from '@/elements/input/TextArea.tsx';
 import TextInput from '@/elements/input/TextInput.tsx';
 import Group from '@/elements/layout/Group.tsx';
+import SegmentedControl from '@/elements/layout/SegmentedControl.tsx';
 import Stack from '@/elements/layout/Stack.tsx';
 import Text from '@/elements/typography/Text.tsx';
 import { useAdminCan } from '@/plugins/usePermissions.ts';
@@ -223,6 +224,35 @@ export default function SettingsPage() {
                 : tExt('settings.provider.testFailed', { error: test.error ?? '' })}
             </Alert>
           )}
+        </Stack>
+      </TitleCard>
+
+      <TitleCard title={tExt('settings.userKeys.title', {})} icon={<FontAwesomeIcon icon={faUserShield} />}>
+        <Stack>
+          <div>
+            <Text size='sm' fw={500} mb={6}>
+              {tExt('settings.userKeys.mode', {})}
+            </Text>
+            <SegmentedControl
+              data={(['off', 'allowed', 'required'] as const).map((mode) => ({
+                value: mode,
+                label: tExt(`settings.userKeys.${mode}`, {}),
+              }))}
+              value={form.userKeys}
+              onChange={(value) => update({ userKeys: value as Settings['userKeys'] })}
+              disabled={!canManage}
+            />
+            <Text size='xs' c='dimmed' mt={6}>
+              {tExt(`settings.userKeys.${form.userKeys}Description`, {})}
+            </Text>
+          </div>
+          <Switch
+            label={tExt('settings.userKeys.customUrls', {})}
+            description={tExt('settings.userKeys.customUrlsDescription', {})}
+            checked={form.allowCustomBaseUrls}
+            onChange={(event) => update({ allowCustomBaseUrls: event.currentTarget.checked })}
+            disabled={!canManage || form.userKeys === 'off'}
+          />
         </Stack>
       </TitleCard>
 

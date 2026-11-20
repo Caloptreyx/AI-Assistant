@@ -2,6 +2,7 @@ import { faRobot } from '@fortawesome/free-solid-svg-icons';
 import { FontAwesomeIcon } from '@fortawesome/react-fontawesome';
 import { createElement } from 'react';
 import { Extension, type ExtensionContext } from 'shared';
+import AccountKeyPage from './pages/AccountKeyPage.tsx';
 import AdminAssistantPage from './pages/AdminAssistantPage.tsx';
 import ServerAssistantPage from './pages/ServerAssistantPage.tsx';
 import SettingsPage from './pages/SettingsPage.tsx';
@@ -26,12 +27,19 @@ class DevCaloptreyxAiAssistantExtension extends Extension {
         path: '/ai-assistant',
         element: AdminAssistantPage,
         permission: 'ai-assistant.chat',
+      })
+      .addAccountRoute({
+        name: () => getExtTranslations().t('account.title', {}),
+        icon: faRobot,
+        path: '/ai-assistant',
+        element: AccountKeyPage,
       });
 
     ctx.extensionRegistry.enterPermissionIcons((icons) =>
       icons
         .addServerPermissionIcon('ai-assistant', createElement(FontAwesomeIcon, { icon: faRobot }))
-        .addAdminPermissionIcon('ai-assistant', createElement(FontAwesomeIcon, { icon: faRobot })),
+        .addAdminPermissionIcon('ai-assistant', createElement(FontAwesomeIcon, { icon: faRobot }))
+        .addUserPermissionIcon('ai-assistant', createElement(FontAwesomeIcon, { icon: faRobot })),
     );
   }
 }
