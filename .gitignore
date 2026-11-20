@@ -1,0 +1,7 @@
+node_modules
+target
+dist
+exported-extensions
+*.c7s.zip
+AGENTS.md
+.agents
