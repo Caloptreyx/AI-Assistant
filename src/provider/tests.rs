@@ -201,6 +201,7 @@ fn provider(kind: ProviderKind) -> Provider {
         api_key: String::new(),
         model: "test-model".into(),
         max_tokens: 1024,
+        pin: None,
     }
 }
 

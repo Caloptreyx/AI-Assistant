@@ -2,7 +2,7 @@
 //! the backend and leave it masked ([`AdminView`]); nothing here is ever sent to the browser in
 //! full.
 
-use crate::provider::Provider;
+use crate::{keys::UserKeyMode, provider::Provider};
 use serde::{Deserialize, Serialize};
 use shared::{
     State,
@@ -38,7 +38,8 @@ pub struct Settings {
     pub admin_chat_enabled: bool,
     /// Messages one user may send per hour; 0 means no limit.
     pub requests_per_hour: u32,
-    /// Tokens (input plus output) one user may use per day; 0 means no limit.
+    /// Tokens (input plus output) one user may use per day on the panel's key; 0 means no
+    /// limit. Chats on a user's own key do not count.
     pub daily_token_limit: u64,
     /// Model calls per message before the assistant has to stop and report.
     pub max_tool_steps: u32,
@@ -52,6 +53,10 @@ pub struct Settings {
     pub retention_days: u32,
     /// Extra instructions appended to the system prompt.
     pub instructions: String,
+    /// Whether users may (or must) bring their own provider key.
+    pub user_keys: UserKeyMode,
+    /// Users may enter their own OpenAI-compatible base URL (still never a private address).
+    pub allow_custom_base_urls: bool,
 }
 
 impl Default for Settings {
@@ -73,6 +78,8 @@ impl Default for Settings {
             history_limit: 60,
             retention_days: 30,
             instructions: String::new(),
+            user_keys: UserKeyMode::Allowed,
+            allow_custom_base_urls: false,
         }
     }
 }
@@ -88,6 +95,12 @@ impl Settings {
                             .into(),
                     );
                 }
+                // Hosted providers need a key; local servers such as Ollama do not.
+                if self.openai_api_key.is_empty()
+                    && !crate::ssrf::is_local_url(&self.openai_base_url)
+                {
+                    return Err("The administrator has not added an API key for the AI provider yet.".into());
+                }
                 Ok(Provider {
                     kind: ProviderKind::Openai,
                     url: format!(
@@ -97,6 +110,7 @@ impl Settings {
                     api_key: self.openai_api_key.clone(),
                     model: self.openai_model.trim().to_string(),
                     max_tokens: self.max_output_tokens,
+                    pin: None,
                 })
             }
             ProviderKind::Anthropic => {
@@ -112,6 +126,7 @@ impl Settings {
                     api_key: self.anthropic_api_key.clone(),
                     model: self.anthropic_model.trim().to_string(),
                     max_tokens: self.max_output_tokens,
+                    pin: None,
                 })
             }
         }
@@ -142,6 +157,8 @@ impl Settings {
             history_limit: self.history_limit,
             retention_days: self.retention_days,
             instructions: self.instructions.clone(),
+            user_keys: self.user_keys,
+            allow_custom_base_urls: self.allow_custom_base_urls,
         }
     }
 }
@@ -184,6 +201,8 @@ pub struct AdminView {
     pub history_limit: u32,
     pub retention_days: u32,
     pub instructions: String,
+    pub user_keys: UserKeyMode,
+    pub allow_custom_base_urls: bool,
 }
 
 /// A settings change from the admin page. A key that is left out (or `null`) stays as it is,
@@ -209,6 +228,9 @@ pub struct Update {
     pub retention_days: u32,
     #[serde(default)]
     pub instructions: String,
+    pub user_keys: UserKeyMode,
+    #[serde(default)]
+    pub allow_custom_base_urls: bool,
 }
 
 fn check_range<T: PartialOrd + std::fmt::Display>(
@@ -329,6 +351,8 @@ impl Update {
         settings.history_limit = self.history_limit;
         settings.retention_days = self.retention_days;
         settings.instructions = self.instructions.trim().to_string();
+        settings.user_keys = self.user_keys;
+        settings.allow_custom_base_urls = self.allow_custom_base_urls;
     }
 }
 
@@ -353,6 +377,8 @@ impl SettingsSerializeExt for Settings {
             .write_serde_setting("history_limit", &self.history_limit)?
             .write_serde_setting("retention_days", &self.retention_days)?
             .write_serde_setting("instructions", &self.instructions)?
+            .write_serde_setting("user_keys", &self.user_keys)?
+            .write_serde_setting("allow_custom_base_urls", &self.allow_custom_base_urls)?
             .write_raw_encrypted_setting("openai_api_key", self.openai_api_key.as_str())
             .await?
             .write_raw_encrypted_setting("anthropic_api_key", self.anthropic_api_key.as_str())
@@ -408,6 +434,8 @@ impl SettingsDeserializeExt for SettingsDataDeserializer {
             history_limit: serde_or!("history_limit", d.history_limit),
             retention_days: serde_or!("retention_days", d.retention_days),
             instructions: serde_or!("instructions", d.instructions),
+            user_keys: serde_or!("user_keys", d.user_keys),
+            allow_custom_base_urls: serde_or!("allow_custom_base_urls", d.allow_custom_base_urls),
         }))
     }
 }
@@ -442,6 +470,8 @@ mod tests {
             history_limit: 20,
             retention_days: 7,
             instructions: String::new(),
+            user_keys: UserKeyMode::Required,
+            allow_custom_base_urls: true,
         }
     }
 
@@ -493,6 +523,8 @@ mod tests {
         assert_eq!(settings.openai_api_key, "old-key");
         assert_eq!(settings.anthropic_api_key, "");
         assert_eq!(settings.openai_model, "openai/gpt-4o");
+        assert_eq!(settings.user_keys, UserKeyMode::Required);
+        assert!(settings.allow_custom_base_urls);
         let provider = settings.provider().unwrap();
         assert_eq!(provider.url, "https://openrouter.ai/api/v1/chat/completions");
     }
@@ -519,5 +551,22 @@ mod tests {
             ..settings
         };
         assert_eq!(settings.provider().unwrap().kind, ProviderKind::Anthropic);
+    }
+
+    #[test]
+    fn hosted_openai_compatible_providers_need_a_key_but_local_servers_do_not() {
+        // The defaults point at api.openai.com without a key: not set up.
+        let settings = Settings::default();
+        assert!(settings.provider().is_err());
+        let ollama = Settings {
+            openai_base_url: "http://localhost:11434/v1".into(),
+            ..Default::default()
+        };
+        assert!(ollama.provider().is_ok());
+        let keyed = Settings {
+            openai_api_key: "sk-1".into(),
+            ..Default::default()
+        };
+        assert!(keyed.provider().is_ok());
     }
 }

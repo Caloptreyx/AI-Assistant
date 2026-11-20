@@ -14,18 +14,21 @@ use serde_json::Value;
 use sse::{SseDecoder, SseEvent};
 use std::{sync::LazyLock, time::Duration};
 
-static CLIENT: LazyLock<reqwest::Client> = LazyLock::new(|| {
+fn client_builder() -> reqwest::ClientBuilder {
     reqwest::Client::builder()
         .connect_timeout(Duration::from_secs(10))
         // Reasoning models can think for a while before the first token.
         .read_timeout(Duration::from_secs(180))
+        // Providers answer directly; a redirect could lead a vetted request somewhere else.
+        .redirect(reqwest::redirect::Policy::none())
         .user_agent(concat!(
             "Calagopus-AI-Assistant/",
             env!("CARGO_PKG_VERSION")
         ))
-        .build()
-        .unwrap_or_default()
-});
+}
+
+static CLIENT: LazyLock<reqwest::Client> =
+    LazyLock::new(|| client_builder().build().unwrap_or_default());
 
 pub struct Provider {
     pub kind: ProviderKind,
@@ -34,6 +37,8 @@ pub struct Provider {
     pub api_key: String,
     pub model: String,
     pub max_tokens: u32,
+    /// For user-supplied URLs: connect only to these vetted addresses.
+    pub pin: Option<crate::ssrf::Pin>,
 }
 
 pub struct ToolSpec {
@@ -194,16 +199,23 @@ impl Provider {
         }
     }
 
-    fn request(&self, body: &Value) -> reqwest::RequestBuilder {
-        let request = CLIENT.post(&self.url).json(body);
-        match self.kind {
+    fn request(&self, body: &Value) -> Result<reqwest::RequestBuilder, String> {
+        let client = match &self.pin {
+            None => CLIENT.clone(),
+            Some(pin) => client_builder()
+                .resolve_to_addrs(&pin.host, &pin.addrs)
+                .build()
+                .map_err(|err| format!("Could not prepare the request: {err}"))?,
+        };
+        let request = client.post(&self.url).json(body);
+        Ok(match self.kind {
             // Local servers such as Ollama need no key.
             ProviderKind::Openai if self.api_key.is_empty() => request,
             ProviderKind::Openai => request.bearer_auth(&self.api_key),
             ProviderKind::Anthropic => request
                 .header("x-api-key", self.api_key.as_str())
                 .header("anthropic-version", anthropic::VERSION),
-        }
+        })
     }
 
     /// Sends `body` and streams the answer, calling `on_text` with every text delta.
@@ -213,7 +225,7 @@ impl Provider {
         mut on_text: impl FnMut(&str),
     ) -> Result<Completion, String> {
         let response = self
-            .request(body)
+            .request(body)?
             .send()
             .await
             .map_err(|err| format!("Could not reach the AI provider: {err}"))?;

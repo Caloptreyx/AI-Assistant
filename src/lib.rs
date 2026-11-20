@@ -12,11 +12,13 @@ use std::{sync::Arc, time::Duration};
 mod access;
 mod chat;
 mod db;
+mod keys;
 mod openapi;
 mod provider;
 mod proxy;
 mod routes;
 mod settings;
+mod ssrf;
 mod tools;
 mod upstream;
 
@@ -74,6 +76,12 @@ impl Extension for ExtensionStruct {
                     routes::admin::router(&state),
                 )
             })
+            .add_client_api_router(|router| {
+                router.nest(
+                    &format!("/extensions/{PACKAGE}"),
+                    routes::account::router(&state),
+                )
+            })
     }
 
     async fn initialize_permissions(
@@ -99,6 +107,16 @@ impl Extension for ExtensionStruct {
                     permissions: IndexMap::from([(
                         "chat",
                         "Allows using the AI assistant in the admin area. It can only read and change what the other admin permissions allow, and every change needs a confirmation.",
+                    )]),
+                },
+            )
+            .add_user_permission_group(
+                "ai-assistant",
+                PermissionGroup {
+                    description: "Permissions for your own AI assistant settings.",
+                    permissions: IndexMap::from([(
+                        "key",
+                        "Allows viewing, changing and testing your own AI provider API key (the key itself is never shown).",
                     )]),
                 },
             )

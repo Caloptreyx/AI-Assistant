@@ -2,6 +2,7 @@
 //! admin chat (`/api/admin/extensions/dev.caloptreyx.aiassistant`). The route modules only check
 //! who may use which chat and hand over a [`Room`].
 
+pub mod account;
 pub mod admin;
 pub mod server;
 
@@ -12,7 +13,10 @@ use crate::{
         prompt::{self, Place},
     },
     db,
+    keys::{self, Choice, KeySource, UserKey, UserKeyMode},
+    provider::Provider,
     settings::{self, Settings},
+    ssrf,
     tools::{self, Effect, Scope, output::clip},
     upstream::{LiveUpstream, Upstream},
 };
@@ -198,8 +202,81 @@ fn busy(conversation: Uuid) -> Result<Busy, ApiResponse> {
     })
 }
 
-/// The per-user message rate and daily token limits.
-async fn check_limits(state: &State, caller: &Caller, settings: &Settings) -> Result<(), ApiResponse> {
+/// Which key a user's chat would use, without decrypting anything.
+async fn key_choice(
+    state: &State,
+    caller: &Caller,
+    settings: &Settings,
+) -> Result<(Choice, Option<db::StoredUserKey>), ApiResponse> {
+    let user_key = match settings.user_keys {
+        UserKeyMode::Off => None,
+        UserKeyMode::Allowed | UserKeyMode::Required => {
+            db::user_key(&state.database, caller.user.uuid).await?
+        }
+    };
+    let choice = keys::choose(
+        settings.user_keys,
+        user_key.is_some(),
+        settings.provider().map(drop),
+    );
+    Ok((choice, user_key))
+}
+
+pub async fn decrypt_user_key(
+    state: &State,
+    stored: db::StoredUserKey,
+) -> Result<UserKey, ApiResponse> {
+    let api_key = state
+        .database
+        .decrypt_base64(&stored.api_key_encrypted)
+        .await
+        .map_err(|_| {
+            error(
+                StatusCode::CONFLICT,
+                "Your stored API key could not be read. Enter it again under Account → AI Assistant.",
+            )
+        })?;
+    Ok(UserKey {
+        preset: stored.preset,
+        base_url: stored.base_url,
+        model: stored.model,
+        api_key: api_key.to_string(),
+    })
+}
+
+/// The provider a chat uses and whose key pays for it.
+async fn select_provider(
+    state: &State,
+    caller: &Caller,
+    settings: &Settings,
+) -> Result<(Provider, KeySource), ApiResponse> {
+    let conflict = |problem: String| error(StatusCode::CONFLICT, problem);
+    let (choice, user_key) = key_choice(state, caller, settings).await?;
+    match choice {
+        Choice::Use(KeySource::Panel) => settings
+            .provider()
+            .map(|provider| (provider, KeySource::Panel))
+            .map_err(conflict),
+        Choice::Use(KeySource::User) => {
+            let stored = user_key.ok_or_else(|| conflict(keys::NEEDS_USER_KEY.into()))?;
+            let key = decrypt_user_key(state, stored).await?;
+            key.provider(settings, &ssrf::Dns)
+                .await
+                .map(|provider| (provider, KeySource::User))
+                .map_err(conflict)
+        }
+        Choice::NeedsUserKey => Err(conflict(keys::NEEDS_USER_KEY.into())),
+        Choice::Unavailable(problem) => Err(conflict(problem)),
+    }
+}
+
+/// The per-user message rate (always) and the daily token limit (only on the panel's key).
+async fn check_limits(
+    state: &State,
+    caller: &Caller,
+    settings: &Settings,
+    source: KeySource,
+) -> Result<(), ApiResponse> {
     if settings.requests_per_hour > 0 {
         state
             .cache
@@ -211,12 +288,14 @@ async fn check_limits(state: &State, caller: &Caller, settings: &Settings) -> Re
             )
             .await?;
     }
-    if settings.daily_token_limit > 0
-        && db::tokens_today(&state.database, caller.user.uuid).await? >= settings.daily_token_limit
+    if source == KeySource::Panel
+        && settings.daily_token_limit > 0
+        && db::tokens_today(&state.database, caller.user.uuid, KeySource::Panel).await?
+            >= settings.daily_token_limit
     {
         return Err(error(
             StatusCode::TOO_MANY_REQUESTS,
-            "You used up today's AI assistant token allowance. It resets at midnight (database time).",
+            "You used up today's AI assistant token allowance on the panel's key. It resets at midnight (database time).",
         ));
     }
     Ok(())
@@ -224,7 +303,6 @@ async fn check_limits(state: &State, caller: &Caller, settings: &Settings) -> Re
 
 pub async fn info(state: &State, caller: &Caller, room: &Room) -> ApiResponseResult {
     let settings = settings::load(state).await?;
-    let problem = settings.provider().err();
     let scope = room.scope();
     let tools: Vec<_> = tools::available(&scope, &caller.permissions)
         .into_iter()
@@ -237,17 +315,36 @@ pub async fn info(state: &State, caller: &Caller, room: &Room) -> ApiResponseRes
         })
         .collect();
 
-    let tokens_today = db::tokens_today(&state.database, caller.user.uuid).await?;
+    let (choice, user_key) = key_choice(state, caller, &settings).await?;
+    let has_user_key = user_key.is_some();
+    let (source, problem) = match choice {
+        Choice::Use(source) => (Some(source), None),
+        Choice::NeedsUserKey => (None, Some(keys::NEEDS_USER_KEY.to_string())),
+        Choice::Unavailable(problem) => (None, Some(problem)),
+    };
+    let model = match (source, user_key) {
+        (Some(KeySource::User), Some(key)) => key.model,
+        _ => settings.model().to_string(),
+    };
+    let panel_tokens =
+        db::tokens_today(&state.database, caller.user.uuid, KeySource::Panel).await?;
+    let user_tokens = db::tokens_today(&state.database, caller.user.uuid, KeySource::User).await?;
 
     ApiResponse::new_serialized(json!({
         "enabled": room.enabled(&settings),
-        "configured": problem.is_none(),
+        "configured": source.is_some(),
         "problem": problem,
-        "provider": settings.provider,
-        "model": settings.model(),
+        "model": model,
         "tools": tools,
+        "access": {
+            "mode": settings.user_keys,
+            "source": source,
+            "needs_user_key": problem.is_some() && settings.user_keys != UserKeyMode::Off && !has_user_key,
+            "has_user_key": has_user_key,
+        },
         "usage": {
-            "tokens_today": tokens_today,
+            "tokens_today": panel_tokens,
+            "own_key_tokens_today": user_tokens,
             "daily_token_limit": settings.daily_token_limit,
             "requests_per_hour": settings.requests_per_hour,
         },
@@ -303,19 +400,68 @@ pub async fn delete(state: &State, caller: &Caller, room: &Room, uuid: Uuid) -> 
     ApiResponse::new_serialized(json!({})).ok()
 }
 
+#[derive(Deserialize)]
+pub struct RenamePayload {
+    title: String,
+}
+
+pub async fn rename(
+    state: &State,
+    caller: &Caller,
+    room: &Room,
+    uuid: Uuid,
+    data: RenamePayload,
+) -> ApiResponseResult {
+    find_conversation(state, caller, room, uuid).await?;
+    let title = data.title.trim();
+    if title.is_empty() || title.chars().count() > 255 {
+        return Err(error(
+            StatusCode::BAD_REQUEST,
+            "A title must be 1 to 255 characters long.",
+        ));
+    }
+    db::rename_conversation(&state.database, uuid, title).await?;
+    ApiResponse::new_serialized(json!({
+        "conversation": find_conversation(state, caller, room, uuid).await?,
+    }))
+    .ok()
+}
+
+/// Stops the model call running in a conversation. Proposed actions stay as they are.
+pub async fn stop(state: &State, caller: &Caller, room: &Room, uuid: Uuid) -> ApiResponseResult {
+    find_conversation(state, caller, room, uuid).await?;
+    ApiResponse::new_serialized(json!({ "stopped": chat::stop(uuid) })).ok()
+}
+
+/// Sends a one-word request and reports whether the provider answered, for the "Test connection"
+/// buttons.
+pub async fn probe(provider: &Provider) -> serde_json::Value {
+    let history = [Entry::User {
+        text: "Reply with the single word OK.".into(),
+    }];
+    let body = provider.body("You are a connection test.", &history, &[]);
+    match provider.complete(&body, |_| {}).await {
+        Ok(completion) => json!({
+            "ok": true,
+            "reply": completion.text.chars().take(200).collect::<String>(),
+            "model": provider.model,
+        }),
+        Err(err) => json!({ "ok": false, "error": err }),
+    }
+}
+
 /// Gathers everything for a turn and streams it as server-sent events. `prelude` is sent first.
+#[allow(clippy::too_many_arguments)]
 async fn start_turn(
     state: &State,
     caller: &Caller,
     room: &Room,
     settings: Settings,
+    (provider, source): (Provider, KeySource),
     conversation: Uuid,
     guard: Busy,
     prelude: Vec<Event>,
 ) -> ApiResponseResult {
-    let provider = settings
-        .provider()
-        .map_err(|problem| error(StatusCode::CONFLICT, problem))?;
     let panel = {
         let panel_settings = state.settings.get().await?;
         panel_settings.app.name.to_string()
@@ -344,6 +490,7 @@ async fn start_turn(
     let turn = Turn {
         state: state.clone(),
         provider,
+        source,
         conversation,
         user: caller.user.uuid,
         scope,
@@ -357,9 +504,10 @@ async fn start_turn(
     for event in prelude {
         let _ = events.send(event);
     }
+    let cancel = guard.cancel_token();
     tokio::spawn(async move {
         let _guard = guard;
-        chat::run(turn, events).await;
+        chat::run(turn, events, cancel).await;
     });
 
     let stream = futures_util::stream::unfold(receiver, |mut receiver| async move {
@@ -438,12 +586,10 @@ pub async fn send(
         ));
     }
     let settings = enabled_settings(state, room).await?;
-    if let Err(problem) = settings.provider() {
-        return Err(error(StatusCode::CONFLICT, problem));
-    }
     find_conversation(state, caller, room, uuid).await?;
+    let selected = select_provider(state, caller, &settings).await?;
     let guard = busy(uuid)?;
-    check_limits(state, caller, &settings).await?;
+    check_limits(state, caller, &settings, selected.1).await?;
 
     let mut prelude = reject_pending(
         state,
@@ -466,7 +612,7 @@ pub async fn send(
         db::touch_conversation(&state.database, uuid, Some(&title)).await?;
     }
 
-    start_turn(state, caller, room, settings, uuid, guard, prelude).await
+    start_turn(state, caller, room, settings, selected, uuid, guard, prelude).await
 }
 
 /// Lets the model go on after the user decided every proposed action (or after an error).
@@ -495,9 +641,10 @@ pub async fn resume(state: &State, caller: &Caller, room: &Room, uuid: Uuid) -> 
             "The assistant has already answered; send a new message.",
         ));
     }
-    check_limits(state, caller, &settings).await?;
+    let selected = select_provider(state, caller, &settings).await?;
+    check_limits(state, caller, &settings, selected.1).await?;
 
-    start_turn(state, caller, room, settings, uuid, guard, Vec::new()).await
+    start_turn(state, caller, room, settings, selected, uuid, guard, Vec::new()).await
 }
 
 #[derive(Deserialize)]

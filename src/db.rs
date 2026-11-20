@@ -1,6 +1,9 @@
 //! Conversations, their entries, proposed actions and per-user usage.
 
-use crate::chat::entry::{Entry, ToolCall};
+use crate::{
+    chat::entry::{Entry, ToolCall},
+    keys::KeySource,
+};
 use chrono::{DateTime, Utc};
 use serde::Serialize;
 use serde_json::Value;
@@ -300,20 +303,22 @@ pub async fn fail_interrupted_actions(db: &Database, conversation: Uuid) -> Resu
 pub async fn record_usage(
     db: &Database,
     user: Uuid,
+    source: KeySource,
     requests: i32,
     input_tokens: u64,
     output_tokens: u64,
 ) -> Result<(), sqlx::Error> {
     sqlx::query(
         "INSERT INTO dev_caloptreyx_aiassistant_usage
-             (user_uuid, day, requests, input_tokens, output_tokens)
-         VALUES ($1, CURRENT_DATE, $2, $3, $4)
-         ON CONFLICT (user_uuid, day) DO UPDATE SET
+             (user_uuid, day, source, requests, input_tokens, output_tokens)
+         VALUES ($1, CURRENT_DATE, $2, $3, $4, $5)
+         ON CONFLICT (user_uuid, day, source) DO UPDATE SET
              requests = dev_caloptreyx_aiassistant_usage.requests + EXCLUDED.requests,
              input_tokens = dev_caloptreyx_aiassistant_usage.input_tokens + EXCLUDED.input_tokens,
              output_tokens = dev_caloptreyx_aiassistant_usage.output_tokens + EXCLUDED.output_tokens",
     )
     .bind(user)
+    .bind(source.as_str())
     .bind(requests)
     .bind(input_tokens.min(i64::MAX as u64) as i64)
     .bind(output_tokens.min(i64::MAX as u64) as i64)
@@ -322,14 +327,92 @@ pub async fn record_usage(
     Ok(())
 }
 
-/// Tokens (input plus output) the user used today.
-pub async fn tokens_today(db: &Database, user: Uuid) -> Result<u64, sqlx::Error> {
+/// Tokens (input plus output) the user used today, per key that paid.
+pub async fn tokens_today(db: &Database, user: Uuid, source: KeySource) -> Result<u64, sqlx::Error> {
     let tokens: Option<i64> = sqlx::query_scalar(
         "SELECT input_tokens + output_tokens FROM dev_caloptreyx_aiassistant_usage
-         WHERE user_uuid = $1 AND day = CURRENT_DATE",
+         WHERE user_uuid = $1 AND day = CURRENT_DATE AND source = $2",
+    )
+    .bind(user)
+    .bind(source.as_str())
+    .fetch_optional(db.read())
+    .await?;
+    Ok(tokens.unwrap_or(0).max(0) as u64)
+}
+
+pub async fn rename_conversation(db: &Database, uuid: Uuid, title: &str) -> Result<(), sqlx::Error> {
+    sqlx::query(
+        "UPDATE dev_caloptreyx_aiassistant_conversations SET title = $2 WHERE uuid = $1",
+    )
+    .bind(uuid)
+    .bind(title)
+    .execute(db.write())
+    .await?;
+    Ok(())
+}
+
+/// A user's stored provider key; the key itself stays encrypted until it is used.
+pub struct StoredUserKey {
+    pub preset: String,
+    pub base_url: Option<String>,
+    pub model: String,
+    pub api_key_encrypted: String,
+    pub updated: DateTime<Utc>,
+}
+
+pub async fn user_key(db: &Database, user: Uuid) -> Result<Option<StoredUserKey>, sqlx::Error> {
+    let row: Option<(String, Option<String>, String, String, DateTime<Utc>)> = sqlx::query_as(
+        "SELECT preset, base_url, model, api_key_encrypted, updated
+         FROM dev_caloptreyx_aiassistant_user_keys WHERE user_uuid = $1",
     )
     .bind(user)
     .fetch_optional(db.read())
     .await?;
-    Ok(tokens.unwrap_or(0).max(0) as u64)
+    Ok(row.map(
+        |(preset, base_url, model, api_key_encrypted, updated)| StoredUserKey {
+            preset,
+            base_url,
+            model,
+            api_key_encrypted,
+            updated,
+        },
+    ))
+}
+
+/// Stores a user's key. `api_key_encrypted` is `None` to keep the stored key.
+pub async fn save_user_key(
+    db: &Database,
+    user: Uuid,
+    preset: &str,
+    base_url: Option<&str>,
+    model: &str,
+    api_key_encrypted: Option<&str>,
+) -> Result<(), sqlx::Error> {
+    sqlx::query(
+        "INSERT INTO dev_caloptreyx_aiassistant_user_keys
+             (user_uuid, preset, base_url, model, api_key_encrypted)
+         VALUES ($1, $2, $3, $4, COALESCE($5, ''))
+         ON CONFLICT (user_uuid) DO UPDATE SET
+             preset = EXCLUDED.preset,
+             base_url = EXCLUDED.base_url,
+             model = EXCLUDED.model,
+             api_key_encrypted = COALESCE($5, dev_caloptreyx_aiassistant_user_keys.api_key_encrypted),
+             updated = now()",
+    )
+    .bind(user)
+    .bind(preset)
+    .bind(base_url)
+    .bind(model)
+    .bind(api_key_encrypted)
+    .execute(db.write())
+    .await?;
+    Ok(())
+}
+
+pub async fn delete_user_key(db: &Database, user: Uuid) -> Result<(), sqlx::Error> {
+    sqlx::query("DELETE FROM dev_caloptreyx_aiassistant_user_keys WHERE user_uuid = $1")
+        .bind(user)
+        .execute(db.write())
+        .await?;
+    Ok(())
 }

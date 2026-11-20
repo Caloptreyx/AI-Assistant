@@ -7,6 +7,7 @@ pub mod prompt;
 
 use crate::{
     db,
+    keys::KeySource,
     provider::{Provider, ToolSpec},
     settings::Settings,
     tools::{self, Permissions, Scope, Unconfirmed, output::clip},
@@ -17,10 +18,11 @@ use entry::Entry;
 use serde_json::json;
 use shared::{State, models::user::PermissionManager};
 use std::{
-    collections::HashSet,
+    collections::HashMap,
     sync::{Arc, LazyLock, Mutex},
 };
 use tokio::sync::mpsc::UnboundedSender;
+use tokio_util::sync::CancellationToken;
 use uuid::Uuid;
 
 /// What the browser receives while a turn runs.
@@ -34,6 +36,8 @@ pub enum Event {
     /// The model proposed a change; it waits for the user.
     Action(db::Action),
     Error(String),
+    /// The user stopped the turn.
+    Stopped,
     /// The turn is over. `waiting` when actions wait for the user's decision.
     Done { waiting: bool },
 }
@@ -46,30 +50,59 @@ impl Event {
             Self::Tool { call_id, name } => ("tool", json!({ "call_id": call_id, "name": name })),
             Self::Action(action) => ("action", json!(action)),
             Self::Error(message) => ("error", json!({ "message": message })),
+            Self::Stopped => ("stopped", json!({})),
             Self::Done { waiting } => ("done", json!({ "waiting": waiting })),
         };
         sse::Event::default().event(name).data(data.to_string())
     }
 }
 
-static BUSY: LazyLock<Mutex<HashSet<Uuid>>> = LazyLock::new(Default::default);
+static BUSY: LazyLock<Mutex<HashMap<Uuid, CancellationToken>>> = LazyLock::new(Default::default);
+
+fn busy_map() -> std::sync::MutexGuard<'static, HashMap<Uuid, CancellationToken>> {
+    BUSY.lock().unwrap_or_else(|poisoned| poisoned.into_inner())
+}
 
 /// Held while something changes a conversation (a turn, a decision), so two of them never
 /// interleave their entries.
-pub struct Busy(Uuid);
+pub struct Busy {
+    conversation: Uuid,
+    cancel: CancellationToken,
+}
 
 impl Busy {
     pub fn acquire(conversation: Uuid) -> Option<Self> {
-        let mut busy = BUSY.lock().unwrap_or_else(|poisoned| poisoned.into_inner());
-        busy.insert(conversation).then_some(Self(conversation))
+        let mut busy = busy_map();
+        if busy.contains_key(&conversation) {
+            return None;
+        }
+        let cancel = CancellationToken::new();
+        busy.insert(conversation, cancel.clone());
+        Some(Self {
+            conversation,
+            cancel,
+        })
+    }
+
+    pub fn cancel_token(&self) -> CancellationToken {
+        self.cancel.clone()
     }
 }
 
 impl Drop for Busy {
     fn drop(&mut self) {
-        BUSY.lock()
-            .unwrap_or_else(|poisoned| poisoned.into_inner())
-            .remove(&self.0);
+        busy_map().remove(&self.conversation);
+    }
+}
+
+/// Asks the turn running in a conversation to stop. False when nothing runs there.
+pub fn stop(conversation: Uuid) -> bool {
+    match busy_map().get(&conversation) {
+        Some(cancel) => {
+            cancel.cancel();
+            true
+        }
+        None => false,
     }
 }
 
@@ -78,6 +111,8 @@ pub struct Turn {
     pub state: State,
     pub settings: Settings,
     pub provider: Provider,
+    /// Whose key pays for this turn.
+    pub source: KeySource,
     pub conversation: Uuid,
     pub user: Uuid,
     pub scope: Scope,
@@ -86,12 +121,20 @@ pub struct Turn {
     pub system: String,
 }
 
-/// Runs the turn to its end, even when the browser goes away, and reports through `events`.
-pub async fn run(turn: Turn, events: UnboundedSender<Event>) {
-    let waiting = match steps(&turn, &events).await {
-        Ok(waiting) => waiting,
-        Err(message) => {
-            let _ = events.send(Event::Error(message));
+/// Runs the turn to its end (or until the user stops it), even when the browser goes away, and
+/// reports through `events`. Stopping drops the model call in flight; changes never run here, so
+/// nothing is left half done.
+pub async fn run(turn: Turn, events: UnboundedSender<Event>, cancel: CancellationToken) {
+    let waiting = tokio::select! {
+        outcome = steps(&turn, &events) => match outcome {
+            Ok(waiting) => waiting,
+            Err(message) => {
+                let _ = events.send(Event::Error(message));
+                false
+            }
+        },
+        () = cancel.cancelled() => {
+            let _ = events.send(Event::Stopped);
             false
         }
     };
@@ -136,8 +179,15 @@ async fn steps(turn: &Turn, events: &UnboundedSender<Event>) -> Result<bool, Str
             })
             .await?;
         let usage = completion.usage_or_estimate(&body);
-        if let Err(err) =
-            db::record_usage(&turn.state.database, turn.user, 1, usage.input, usage.output).await
+        if let Err(err) = db::record_usage(
+            &turn.state.database,
+            turn.user,
+            turn.source,
+            1,
+            usage.input,
+            usage.output,
+        )
+        .await
         {
             tracing::warn!("ai assistant: could not record usage: {err}");
         }

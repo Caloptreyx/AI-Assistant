@@ -2,11 +2,8 @@
 //! `/api/admin/extensions/dev.caloptreyx.aiassistant`. The chat needs the `ai-assistant.chat`
 //! admin permission; the settings need `extensions.read` / `extensions.manage`.
 
-use super::{Caller, CreatePayload, Decision, RejectPayload, Room, SendPayload};
-use crate::{
-    chat::entry::Entry,
-    settings::{self, Settings, Update},
-};
+use super::{Caller, CreatePayload, Decision, RejectPayload, RenamePayload, Room, SendPayload};
+use crate::settings::{self, Settings, Update};
 use axum::{
     extract::Path,
     http::StatusCode,
@@ -52,6 +49,19 @@ async fn delete(
     Path(conversation): Path<Uuid>,
 ) -> ApiResponseResult {
     super::delete(&state, &caller, &room(&caller)?, conversation).await
+}
+
+async fn rename(
+    state: GetState,
+    caller: Caller,
+    Path(conversation): Path<Uuid>,
+    Payload(data): Payload<RenamePayload>,
+) -> ApiResponseResult {
+    super::rename(&state, &caller, &room(&caller)?, conversation, data).await
+}
+
+async fn stop(state: GetState, caller: Caller, Path(conversation): Path<Uuid>) -> ApiResponseResult {
+    super::stop(&state, &caller, &room(&caller)?, conversation).await
 }
 
 async fn send(
@@ -154,35 +164,24 @@ async fn put_settings(
 async fn test_settings(state: GetState, caller: Caller) -> ApiResponseResult {
     caller.permissions.has_admin_permission("extensions.manage")?;
     let settings = settings::load(&state).await?;
-    let provider = match settings.provider() {
-        Ok(provider) => provider,
-        Err(problem) => {
-            return ApiResponse::new_serialized(json!({ "ok": false, "error": problem })).ok();
-        }
+    let outcome = match settings.provider() {
+        Ok(provider) => super::probe(&provider).await,
+        Err(problem) => json!({ "ok": false, "error": problem }),
     };
-    let history = [Entry::User {
-        text: "Reply with the single word OK.".into(),
-    }];
-    let body = provider.body("You are a connection test.", &history, &[]);
-    match provider.complete(&body, |_| {}).await {
-        Ok(completion) => ApiResponse::new_serialized(json!({
-            "ok": true,
-            "reply": completion.text.chars().take(200).collect::<String>(),
-            "model": provider.model,
-            "usage": { "input": completion.usage.input, "output": completion.usage.output },
-        }))
-        .ok(),
-        Err(err) => ApiResponse::new_serialized(json!({ "ok": false, "error": err })).ok(),
-    }
+    ApiResponse::new_serialized(outcome).ok()
 }
 
 pub fn router(state: &State) -> OpenApiRouter<State> {
     OpenApiRouter::new()
         .route("/", get(info))
         .route("/conversations", get(list).post(create))
-        .route("/conversations/{conversation}", get(show).delete(delete))
+        .route(
+            "/conversations/{conversation}",
+            get(show).delete(delete).patch(rename),
+        )
         .route("/conversations/{conversation}/messages", post(send))
         .route("/conversations/{conversation}/continue", post(resume))
+        .route("/conversations/{conversation}/stop", post(stop))
         .route(
             "/conversations/{conversation}/actions/{action}/confirm",
             post(confirm),

@@ -2,7 +2,7 @@
 //! server and the user's permissions on it before these handlers run; using the chat needs the
 //! `ai-assistant.chat` server permission.
 
-use super::{Caller, CreatePayload, Decision, RejectPayload, Room, SendPayload};
+use super::{Caller, CreatePayload, Decision, RejectPayload, RenamePayload, Room, SendPayload};
 use axum::{
     extract::Path,
     http::StatusCode,
@@ -57,6 +57,23 @@ async fn delete(
     super::delete(&state, &caller, &room(&caller)?, conversation).await
 }
 
+async fn rename(
+    state: GetState,
+    caller: Caller,
+    Path((_server, conversation)): Path<(String, Uuid)>,
+    Payload(data): Payload<RenamePayload>,
+) -> ApiResponseResult {
+    super::rename(&state, &caller, &room(&caller)?, conversation, data).await
+}
+
+async fn stop(
+    state: GetState,
+    caller: Caller,
+    Path((_server, conversation)): Path<(String, Uuid)>,
+) -> ApiResponseResult {
+    super::stop(&state, &caller, &room(&caller)?, conversation).await
+}
+
 async fn send(
     state: GetState,
     caller: Caller,
@@ -105,9 +122,13 @@ pub fn router(state: &State) -> OpenApiRouter<State> {
     OpenApiRouter::new()
         .route("/", get(info))
         .route("/conversations", get(list).post(create))
-        .route("/conversations/{conversation}", get(show).delete(delete))
+        .route(
+            "/conversations/{conversation}",
+            get(show).delete(delete).patch(rename),
+        )
         .route("/conversations/{conversation}/messages", post(send))
         .route("/conversations/{conversation}/continue", post(resume))
+        .route("/conversations/{conversation}/stop", post(stop))
         .route(
             "/conversations/{conversation}/actions/{action}/confirm",
             post(confirm),
