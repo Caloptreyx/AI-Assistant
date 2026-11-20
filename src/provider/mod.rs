@@ -55,6 +55,27 @@ pub struct Completion {
     pub usage: Usage,
 }
 
+impl Completion {
+    /// The tokens the provider reported, or a rough estimate (four characters per token) when it
+    /// reported none, as some OpenAI-compatible servers do in streams, so the daily token limit
+    /// still applies to them.
+    pub fn usage_or_estimate(&self, body: &Value) -> Usage {
+        if self.usage != Usage::default() {
+            return self.usage;
+        }
+        let output = self.text.len()
+            + self
+                .tool_calls
+                .iter()
+                .map(|call| call.name.len() + call.arguments.to_string().len())
+                .sum::<usize>();
+        Usage {
+            input: (body.to_string().len() / 4) as u64,
+            output: output.div_ceil(4) as u64,
+        }
+    }
+}
+
 /// Tool arguments as JSON: `{}` for nothing, the raw text when it does not parse (the tool then
 /// reports that to the model).
 pub fn parse_arguments(raw: &str) -> Value {

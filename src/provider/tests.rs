@@ -107,6 +107,27 @@ fn errors_inside_the_stream_are_reported() {
 }
 
 #[test]
+fn missing_usage_is_estimated_so_the_token_limit_still_counts() {
+    // The Ollama sample reports no usage at all.
+    let completion = read(ProviderKind::Openai, OLLAMA, 4096).1.unwrap();
+    assert_eq!(completion.usage, Usage::default());
+    let body = json!({ "messages": [{ "role": "user", "content": "x".repeat(400) }] });
+    let usage = completion.usage_or_estimate(&body);
+    assert!(usage.input >= 100, "{usage:?}");
+    assert!(usage.output > 0, "{usage:?}");
+
+    // Reported usage is used as it is.
+    let completion = read(ProviderKind::Openai, OPENAI, 4096).1.unwrap();
+    assert_eq!(
+        completion.usage_or_estimate(&body),
+        Usage {
+            input: 812,
+            output: 41
+        }
+    );
+}
+
+#[test]
 fn a_body_without_events_is_an_error() {
     let err = read(ProviderKind::Openai, "{\"choices\":[]}", 100)
         .1

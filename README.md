@@ -57,7 +57,7 @@ Other settings:
 |---|---|---|
 | Server chat / Admin chat | on / on | Where the assistant is offered |
 | Messages per user per hour | 30 | `0` = unlimited (panel rate limiter, per user) |
-| Tokens per user per day | 500 000 | Input + output, counted from the provider's usage; `0` = unlimited |
+| Tokens per user per day | 500 000 | Input + output as the provider reports them (estimated at four characters per token when it reports none); `0` = unlimited |
 | Model calls per message | 8 | Tool rounds before the assistant stops and reports |
 | Maximum answer length | 4096 | `max_tokens` for Anthropic |
 | Tool output limit | 12 000 characters | Console logs, files and API responses are cut (start and end kept) before the model sees them |
@@ -110,11 +110,15 @@ actions are rejected and the model is told so.
 
 In the admin chat, server permissions are left to the panel, server by server.
 
-## Privacy
+## Privacy and safety
 
 Conversation text and tool output (console lines, file contents, API responses) are sent to the
 configured provider. Use a local model (Ollama, LM Studio) if that data must not leave your
 infrastructure. API keys are stored encrypted with the panel's database key.
+
+Tool output is untrusted input to the model: a player's chat line or a file could contain
+instructions aimed at it. That is one reason every change waits for a human: read the action card
+before you confirm it.
 
 ## API
 

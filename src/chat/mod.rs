@@ -135,14 +135,9 @@ async fn steps(turn: &Turn, events: &UnboundedSender<Event>) -> Result<bool, Str
                 let _ = events.send(Event::Delta(text.to_string()));
             })
             .await?;
-        if let Err(err) = db::record_usage(
-            &turn.state.database,
-            turn.user,
-            1,
-            completion.usage.input,
-            completion.usage.output,
-        )
-        .await
+        let usage = completion.usage_or_estimate(&body);
+        if let Err(err) =
+            db::record_usage(&turn.state.database, turn.user, 1, usage.input, usage.output).await
         {
             tracing::warn!("ai assistant: could not record usage: {err}");
         }
