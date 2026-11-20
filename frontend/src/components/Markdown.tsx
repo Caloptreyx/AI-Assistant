@@ -20,7 +20,7 @@ function CodeBlock({ content, language }: { content: string; language: string | 
           {language}
         </Text>
       )}
-      <Code block className={`overflow-x-auto pr-10 ${language ? 'pt-7' : ''}`}>
+      <Code block className={`overflow-x-auto pr-10! ${language ? 'pt-7!' : ''}`}>
         {content}
       </Code>
       <CopyButton value={content} timeout={1500}>
@@ -61,7 +61,7 @@ const components: Components = {
 
 export default function ChatMarkdown({ text }: { text: string }) {
   return (
-    <Typography className='min-w-0 break-words text-sm leading-relaxed [&_p:first-child]:mt-0 [&_p:last-child]:mb-0'>
+    <Typography className='min-w-0 break-words text-sm leading-relaxed [&_ol]:list-decimal [&_ol]:pl-6 [&_p:first-child]:mt-0 [&_p:last-child]:mb-0 [&_ul]:list-disc [&_ul]:pl-6'>
       <Markdown remarkPlugins={[remarkGfm]} components={components}>
         {text}
       </Markdown>

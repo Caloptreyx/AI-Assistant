@@ -367,7 +367,14 @@ export default function Chat({ base, admin, onChanged }: { base: string; admin: 
         {list}
       </Drawer>
 
-      <Card withBorder p={0} radius='md' className='flex min-w-0 flex-col overflow-hidden'>
+      <Card
+        withBorder
+        p={0}
+        radius='md'
+        h='calc(100dvh - 12rem)'
+        mih={480}
+        className='flex min-w-0 flex-col overflow-hidden'
+      >
         <Group
           justify='space-between'
           wrap='nowrap'
@@ -408,7 +415,7 @@ export default function Chat({ base, admin, onChanged }: { base: string; admin: 
         </Group>
 
         {data && (
-          <div className='px-4 pt-3 empty:hidden'>
+          <div className='px-4 py-3 empty:hidden'>
             <Notice info={data} />
           </div>
         )}
@@ -418,10 +425,9 @@ export default function Chat({ base, admin, onChanged }: { base: string; admin: 
           </Alert>
         )}
 
-        <div className='relative'>
+        <div className='relative min-h-0 flex-1'>
           <ScrollArea
-            h='calc(100dvh - 21rem)'
-            mih={360}
+            h='100%'
             viewportRef={viewport}
             onScrollPositionChange={({ y }) => {
               const element = viewport.current;
@@ -475,16 +481,18 @@ export default function Chat({ base, admin, onChanged }: { base: string; admin: 
                               {tExt('chat.retry', {})}
                             </Button>
                           )}
-                          {data?.access.mode !== 'off' && /key/i.test(chat.error) && (
-                            <Button
-                              size='xs'
-                              variant='default'
-                              onClick={() => navigate(ACCOUNT_KEY_PATH)}
-                              leftSection={<FontAwesomeIcon icon={faKey} />}
-                            >
-                              {tExt('chat.manageKey', {})}
-                            </Button>
-                          )}
+                          {data &&
+                            data.access.mode !== 'off' &&
+                            (data.access.source === 'user' || /\b40[13]\b|key/i.test(chat.error)) && (
+                              <Button
+                                size='xs'
+                                variant='default'
+                                onClick={() => navigate(ACCOUNT_KEY_PATH)}
+                                leftSection={<FontAwesomeIcon icon={faKey} />}
+                              >
+                                {tExt('chat.manageKey', {})}
+                              </Button>
+                            )}
                         </Group>
                       </Stack>
                     </Alert>

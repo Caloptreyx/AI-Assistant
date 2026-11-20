@@ -71,7 +71,7 @@ const translations = defineTranslations({
       confirm: 'Confirm',
       confirmDanger: 'Confirm anyway',
       reject: 'Reject',
-      danger: 'This deletes or overwrites data, or interrupts players, and cannot simply be undone.',
+      danger: 'Destructive: this can delete or overwrite data or interrupt players, and cannot simply be undone.',
       raw: 'Raw arguments',
       result: 'Result',
     },

@@ -45,11 +45,11 @@ export function describeAction(tool: string, raw: unknown): ActionSummary {
       };
     case 'rename_server': {
       const parts: string[] = [];
-      if (typeof args.name === 'string' && args.name) parts.push(`rename it to ${quoted(args.name)}`);
+      if (typeof args.name === 'string' && args.name) parts.push(`rename the server to ${quoted(args.name)}`);
       if (typeof args.description === 'string') {
         parts.push(args.description ? 'change its description' : 'remove its description');
       }
-      const summary = parts.join(' and ') || 'change its name';
+      const summary = parts.join(' and ') || 'rename the server';
       return plain(`${summary.charAt(0).toUpperCase()}${summary.slice(1)}${where}`);
     }
     case 'write_file':

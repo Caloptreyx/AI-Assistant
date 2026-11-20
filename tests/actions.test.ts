@@ -29,7 +29,11 @@ test('settings changes list what they set', () => {
     describeAction('update_startup_variables', { variables: { MINECRAFT_VERSION: '1.21.4', MAX_PLAYERS: 20 } }).summary,
     'Set MINECRAFT_VERSION = 1.21.4, MAX_PLAYERS = 20 (takes effect after a restart)',
   );
-  assert.equal(describeAction('rename_server', { name: 'Survival' }).summary, 'Rename it to "Survival"');
+  assert.equal(describeAction('rename_server', { name: 'Survival' }).summary, 'Rename the server to "Survival"');
+  assert.equal(
+    describeAction('rename_server', { name: 'Survival', description: 'PvE' }).summary,
+    'Rename the server to "Survival" and change its description',
+  );
   assert.equal(describeAction('rename_server', { description: '' }).summary, 'Remove its description');
 });
 
