@@ -91,17 +91,18 @@ pub async fn rename(ctx: &Ctx, args: &Map<String, Value>) -> Result<String, Stri
     if let Some(name) = name {
         body.insert("name".into(), json!(name));
     }
-    if let Some(description) = description {
-        // An empty description removes it.
-        body.insert(
-            "description".into(),
-            if description.is_empty() {
-                Value::Null
-            } else {
-                json!(description)
-            },
-        );
-    }
+    // The panel requires `description` in every rename (null removes it), so the current one is
+    // sent again when only the name changes.
+    let description = match description {
+        Some("") => Value::Null,
+        Some(description) => json!(description),
+        None => request_json(ctx, Method::GET, &format!("/api/client/servers/{server}"), None, None)
+            .await?
+            .1
+            .and_then(|current| current.pointer("/server/description").cloned())
+            .unwrap_or(Value::Null),
+    };
+    body.insert("description".into(), description);
     request(
         ctx,
         Method::POST,

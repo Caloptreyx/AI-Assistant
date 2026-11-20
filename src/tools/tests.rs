@@ -15,6 +15,7 @@ const SERVER: &str = "123e4567-e89b-12d3-a456-426614174000";
 struct Panel {
     status: u16,
     calls: Mutex<Vec<(Method, String)>>,
+    bodies: Mutex<Vec<Value>>,
 }
 
 impl Panel {
@@ -22,29 +23,40 @@ impl Panel {
         Arc::new(Self {
             status,
             calls: Mutex::new(Vec::new()),
+            bodies: Mutex::new(Vec::new()),
         })
     }
 
     fn calls(&self) -> Vec<(Method, String)> {
         self.calls.lock().unwrap().clone()
     }
+
+    /// The JSON bodies of the requests that had one, in order.
+    fn bodies(&self) -> Vec<Value> {
+        self.bodies.lock().unwrap().clone()
+    }
 }
 
 #[async_trait::async_trait]
 impl Upstream for Panel {
     async fn send(&self, request: Request<Body>) -> Result<Response<Body>, String> {
-        let path = request.uri().path().to_string();
-        self.calls
-            .lock()
-            .unwrap()
-            .push((request.method().clone(), path.clone()));
+        let (parts, body) = request.into_parts();
+        let path = parts.uri.path().to_string();
+        self.calls.lock().unwrap().push((parts.method, path.clone()));
+        let sent = axum::body::to_bytes(body, usize::MAX)
+            .await
+            .map_err(|err| err.to_string())?;
+        if let Ok(json) = serde_json::from_slice::<Value>(&sent) {
+            self.bodies.lock().unwrap().push(json);
+        }
         let body = if self.status >= 400 {
             json!({ "errors": ["you do not have permission to perform this action: files.read"] })
                 .to_string()
         } else if path.ends_with("/logs") {
             "[12:00:00] Done (3.1s)!\n[12:00:05] There are 0 of 20 players online".to_string()
         } else {
-            json!({ "ok": true, "schedule": { "uuid": "5f0e" } }).to_string()
+            json!({ "ok": true, "schedule": { "uuid": "5f0e" }, "server": { "description": "Kept" } })
+                .to_string()
         };
         Response::builder()
             .status(self.status)
@@ -292,6 +304,47 @@ async fn an_unconfirmed_run_cannot_send_anything_but_get() {
             assert_eq!(method, Method::GET, "{} sent {method} {path}", tool.name);
         }
     }
+}
+
+#[tokio::test]
+async fn renaming_keeps_the_current_description() {
+    // The panel's rename endpoint requires `description`; leaving it out failed with HTTP 400
+    // on the dev panel, and sending null would erase it.
+    let panel = Panel::new(200);
+    let grants = Grants::server(&["settings.rename"]);
+    let result = run_confirmed(
+        panel.clone(),
+        &server_scope(),
+        &grants,
+        "rename_server",
+        &json!({ "name": "Survival Two" }),
+    )
+    .await;
+    assert!(result.is_ok(), "{result:?}");
+    assert_eq!(
+        panel.calls(),
+        vec![
+            (Method::GET, format!("/api/client/servers/{SERVER}")),
+            (Method::POST, format!("/api/client/servers/{SERVER}/settings/rename")),
+        ]
+    );
+    assert_eq!(
+        panel.bodies(),
+        vec![json!({ "name": "Survival Two", "description": "Kept" })]
+    );
+
+    // An empty description removes it, without looking up the current one.
+    let panel = Panel::new(200);
+    run_confirmed(
+        panel.clone(),
+        &server_scope(),
+        &grants,
+        "rename_server",
+        &json!({ "description": "" }),
+    )
+    .await
+    .unwrap();
+    assert_eq!(panel.bodies(), vec![json!({ "description": null })]);
 }
 
 #[tokio::test]
