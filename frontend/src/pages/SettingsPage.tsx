@@ -31,6 +31,7 @@ import {
   testSettings,
   updateSettings,
 } from '../api.ts';
+import { CHAT_DISPLAYS } from '../lib/display.ts';
 import { useExtTranslations } from '../translations.ts';
 
 const settingsKey = [PACKAGE, 'settings'] as const;
@@ -272,6 +273,24 @@ export default function SettingsPage() {
             onChange={(event) => update({ adminChatEnabled: event.currentTarget.checked })}
             disabled={!canManage}
           />
+          <div>
+            <Text size='sm' fw={500} mb={6}>
+              {tExt('settings.access.display', {})}
+            </Text>
+            <SegmentedControl
+              data={CHAT_DISPLAYS.map((display) => ({
+                value: display,
+                label: tExt(`settings.access.display_${display}`, {}),
+              }))}
+              value={form.chatDisplay}
+              onChange={(value) => update({ chatDisplay: value as Settings['chatDisplay'] })}
+              disabled={!canManage}
+            />
+            <Text size='xs' c='dimmed' mt={6}>
+              {tExt(`settings.access.display_${form.chatDisplay}Description`, {})}{' '}
+              {tExt('settings.access.displayReload', {})}
+            </Text>
+          </div>
         </Stack>
       </TitleCard>
 

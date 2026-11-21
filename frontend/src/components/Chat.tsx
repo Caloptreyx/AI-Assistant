@@ -10,7 +10,7 @@ import {
 import { FontAwesomeIcon } from '@fortawesome/react-fontawesome';
 import { Loader } from '@mantine/core';
 import { useQuery, useQueryClient } from '@tanstack/react-query';
-import { type KeyboardEvent, useEffect, useMemo, useRef, useState } from 'react';
+import { type KeyboardEvent, type ReactNode, useEffect, useMemo, useRef, useState } from 'react';
 import { useNavigate } from 'react-router';
 import { httpErrorToHuman } from '@/api/axios.ts';
 import ActionIcon from '@/elements/buttons/ActionIcon.tsx';
@@ -50,6 +50,7 @@ import {
   emptyChat,
   loadedChat,
   upsertAction,
+  pendingActions,
   withMessage,
 } from '../lib/chat.ts';
 import { useExtTranslations } from '../translations.ts';
@@ -68,16 +69,18 @@ function EmptyState({
   admin,
   onPick,
   disabled,
+  compact,
 }: {
   admin: boolean;
   onPick: (text: string) => void;
   disabled: boolean;
+  compact: boolean;
 }) {
   const { t: tExt } = useExtTranslations();
   const prompts = (admin ? ADMIN_PROMPTS : SERVER_PROMPTS).map((key) => tExt(`suggestions.${key}`, {}));
 
   return (
-    <Stack align='center' gap='md' py='xl' className='mx-auto max-w-xl text-center'>
+    <Stack align='center' gap='md' py={compact ? 'md' : 'xl'} className='mx-auto max-w-xl text-center'>
       <ThemeIcon variant='light' size={48} radius='md'>
         <FontAwesomeIcon icon={faRobot} size='lg' />
       </ThemeIcon>
@@ -87,7 +90,7 @@ function EmptyState({
           {tExt('empty.body', {})}
         </Text>
       </div>
-      <div className='grid w-full grid-cols-1 gap-2 sm:grid-cols-2'>
+      <div className={`grid w-full grid-cols-1 gap-2 ${compact ? '' : 'sm:grid-cols-2'}`}>
         {prompts.map((prompt) => (
           <Button
             key={prompt}
@@ -149,8 +152,26 @@ function Thinking({ label }: { label: string }) {
 /**
  * The chat for one room: `base` is the server's or the admin area's assistant API. `onChanged`
  * runs after a confirmed action, so the page around the chat can reload what it shows.
+ *
+ * `variant` picks the shell: the sidebar page (conversation list beside the chat) or the floating
+ * window (the list folds over the chat, `actions` sit in the header). `onStatus` tells the
+ * window's button whether an answer is streaming or actions wait while the window is minimised.
  */
-export default function Chat({ base, admin, onChanged }: { base: string; admin: boolean; onChanged?: () => void }) {
+export default function Chat({
+  base,
+  admin,
+  onChanged,
+  variant = 'page',
+  actions,
+  onStatus,
+}: {
+  base: string;
+  admin: boolean;
+  onChanged?: () => void;
+  variant?: 'page' | 'popup';
+  actions?: ReactNode;
+  onStatus?: (status: { busy: boolean; waiting: boolean }) => void;
+}) {
   const navigate = useNavigate();
   const { t: tExt } = useExtTranslations();
   const { addToast } = useToast();
@@ -201,6 +222,11 @@ export default function Chat({ base, admin, onChanged }: { base: string; admin: 
       load(selected);
     }
   }, [base, selected]);
+
+  const waiting = pendingActions(chat).length > 0;
+  useEffect(() => {
+    onStatus?.({ busy: chat.busy, waiting });
+  }, [chat.busy, waiting]);
 
   useEffect(() => () => stream.current?.controller.abort(), []);
 
@@ -360,219 +386,235 @@ export default function Chat({ base, admin, onChanged }: { base: string; admin: 
     />
   );
 
+  const popup = variant === 'popup';
+
+  const card = (
+    <Card
+      withBorder={!popup}
+      p={0}
+      radius={popup ? 0 : 'md'}
+      h={popup ? '100%' : 'calc(100dvh - 12rem)'}
+      mih={popup ? 0 : 480}
+      className='flex min-w-0 flex-col overflow-hidden'
+    >
+      <Group
+        justify='space-between'
+        wrap='nowrap'
+        px='md'
+        py='sm'
+        className='border-b border-[var(--mantine-color-default-border)]'
+      >
+        <Group gap='xs' wrap='nowrap' className='min-w-0'>
+          <ActionIcon
+            variant={popup && listOpen ? 'light' : 'subtle'}
+            color='gray'
+            className={popup ? undefined : 'lg:hidden!'}
+            onClick={() => setListOpen((open) => !open)}
+            aria-label={tExt('conversations.title', {})}
+            aria-expanded={listOpen}
+          >
+            <FontAwesomeIcon icon={faBars} />
+          </ActionIcon>
+          <Text fw={600} truncate='end'>
+            {current?.title ?? tExt('conversations.new', {})}
+          </Text>
+        </Group>
+        <Group gap={6} wrap='nowrap' className='shrink-0'>
+          {data?.access.source === 'user' && (
+            <Tooltip label={tExt('chat.ownKeyHint', {})}>
+              <Badge variant='light' color='teal' leftSection={<FontAwesomeIcon icon={faKey} size='xs' />}>
+                {tExt('chat.ownKey', {})}
+              </Badge>
+            </Tooltip>
+          )}
+          {!popup && data?.configured && (
+            <Badge variant='default' className='hidden! sm:inline-flex!' tt='none'>
+              {data.model}
+            </Badge>
+          )}
+          {actions}
+        </Group>
+      </Group>
+
+      {data && (
+        <div className='px-4 py-3 empty:hidden'>
+          <Notice info={data} />
+        </div>
+      )}
+      {info.error && (
+        <Alert color='red' m='md'>
+          {httpErrorToHuman(info.error)}
+        </Alert>
+      )}
+
+      <div className='relative min-h-0 flex-1'>
+        {popup && listOpen && (
+          <div className='absolute inset-0 z-10 overflow-y-auto bg-[var(--mantine-color-body)] p-3'>{list}</div>
+        )}
+        <ScrollArea
+          h='100%'
+          viewportRef={viewport}
+          onScrollPositionChange={({ y }) => {
+            const element = viewport.current;
+            if (element) {
+              setFollowing(element.scrollHeight - (y + element.clientHeight) < STICK_DISTANCE);
+            }
+          }}
+        >
+          <div className='p-4'>
+            {loading ? (
+              <Group justify='center' py='xl'>
+                <Loader size='sm' />
+              </Group>
+            ) : (
+              <Stack gap='lg'>
+                {chat.messages.length === 0 && !chat.busy && (
+                  <EmptyState admin={admin} onPick={(prompt) => send(prompt)} disabled={!usable} compact={popup} />
+                )}
+                <Timeline chat={chat} titles={titles} onDecide={decide} />
+                {chat.draft && (
+                  <AssistantBlock>
+                    <ChatMarkdown text={chat.draft} />
+                  </AssistantBlock>
+                )}
+                {chat.busy && !chat.draft && (
+                  <Thinking
+                    label={
+                      runningCall
+                        ? tExt('tool.running', { title: titles.get(runningCall.name) ?? runningCall.name })
+                        : tExt('chat.thinking', {})
+                    }
+                  />
+                )}
+                {chat.stopped && !chat.busy && (
+                  <Text size='sm' c='dimmed' ta='center'>
+                    {tExt('chat.stopped', {})}
+                  </Text>
+                )}
+                {chat.error && !chat.busy && (
+                  <Alert color='red' title={tExt('chat.errorTitle', {})}>
+                    <Stack gap='xs' align='flex-start'>
+                      <Text size='sm'>{chat.error}</Text>
+                      <Group gap='xs'>
+                        {selected && canContinue(chat) && (
+                          <Button
+                            size='xs'
+                            variant='default'
+                            leftSection={<FontAwesomeIcon icon={faRotateRight} />}
+                            onClick={() => runTurn(selected, 'continue', {})}
+                          >
+                            {tExt('chat.retry', {})}
+                          </Button>
+                        )}
+                        {data &&
+                          data.access.mode !== 'off' &&
+                          (data.access.source === 'user' || /\b40[13]\b|key/i.test(chat.error)) && (
+                            <Button
+                              size='xs'
+                              variant='default'
+                              onClick={() => navigate(ACCOUNT_KEY_PATH)}
+                              leftSection={<FontAwesomeIcon icon={faKey} />}
+                            >
+                              {tExt('chat.manageKey', {})}
+                            </Button>
+                          )}
+                      </Group>
+                    </Stack>
+                  </Alert>
+                )}
+                {selected && chat.stopped && !chat.busy && !chat.error && canContinue(chat) && (
+                  <Group justify='center'>
+                    <Button
+                      size='xs'
+                      variant='default'
+                      leftSection={<FontAwesomeIcon icon={faRotateRight} />}
+                      onClick={() => runTurn(selected, 'continue', {})}
+                    >
+                      {tExt('chat.retry', {})}
+                    </Button>
+                  </Group>
+                )}
+              </Stack>
+            )}
+          </div>
+        </ScrollArea>
+        {!following && (
+          <ActionIcon
+            radius='xl'
+            size='lg'
+            variant='default'
+            className='absolute! bottom-3 left-1/2 -translate-x-1/2 shadow-md'
+            onClick={scrollToBottom}
+            aria-label={tExt('chat.jumpToLatest', {})}
+          >
+            <FontAwesomeIcon icon={faArrowDown} />
+          </ActionIcon>
+        )}
+      </div>
+
+      <div className='border-t border-[var(--mantine-color-default-border)] p-3'>
+        <Group align='flex-end' gap='xs' wrap='nowrap'>
+          <TextArea
+            ref={composer}
+            className='flex-1'
+            placeholder={tExt('chat.placeholder', {})}
+            value={text}
+            onChange={(event) => setText(event.currentTarget.value)}
+            onKeyDown={onKeyDown}
+            autosize
+            minRows={1}
+            maxRows={8}
+            maxLength={8000}
+            disabled={!usable || chat.busy}
+            aria-label={tExt('chat.placeholder', {})}
+          />
+          {chat.busy ? (
+            <Button color='red' variant='light' leftSection={<FontAwesomeIcon icon={faStop} />} onClick={stop}>
+              {tExt('chat.stop', {})}
+            </Button>
+          ) : (
+            <Button
+              leftSection={<FontAwesomeIcon icon={faPaperPlane} />}
+              onClick={() => send()}
+              disabled={!usable || !text.trim()}
+            >
+              {tExt('chat.send', {})}
+            </Button>
+          )}
+        </Group>
+        {usage && data?.configured && (
+          <Text size='xs' c='dimmed' mt={6} className='tabular-nums'>
+            {data.access.source === 'user'
+              ? tExt('chat.usageOwnKey', { used: usage.own_key_tokens_today.toLocaleString() })
+              : usage.daily_token_limit > 0
+                ? tExt('chat.usage', {
+                    used: usage.tokens_today.toLocaleString(),
+                    limit: usage.daily_token_limit.toLocaleString(),
+                  })
+                : tExt('chat.usageUnlimited', { used: usage.tokens_today.toLocaleString() })}
+            {!popup && (
+              <>
+                {' · '}
+                {tExt('chat.hint', {})}
+              </>
+            )}
+          </Text>
+        )}
+      </div>
+    </Card>
+  );
+
+  if (popup) {
+    return card;
+  }
+
   return (
     <div className='grid grid-cols-1 gap-4 lg:grid-cols-[17rem_minmax(0,1fr)]'>
       <aside className='hidden lg:block'>{list}</aside>
       <Drawer opened={listOpen} onClose={() => setListOpen(false)} title={tExt('conversations.title', {})} size='xs'>
         {list}
       </Drawer>
-
-      <Card
-        withBorder
-        p={0}
-        radius='md'
-        h='calc(100dvh - 12rem)'
-        mih={480}
-        className='flex min-w-0 flex-col overflow-hidden'
-      >
-        <Group
-          justify='space-between'
-          wrap='nowrap'
-          px='md'
-          py='sm'
-          className='border-b border-[var(--mantine-color-default-border)]'
-        >
-          <Group gap='xs' wrap='nowrap' className='min-w-0'>
-            <ActionIcon
-              variant='subtle'
-              color='gray'
-              className='lg:hidden!'
-              onClick={() => setListOpen(true)}
-              aria-label={tExt('conversations.title', {})}
-            >
-              <FontAwesomeIcon icon={faBars} />
-            </ActionIcon>
-            <Text fw={600} truncate='end'>
-              {current?.title ?? tExt('conversations.new', {})}
-            </Text>
-          </Group>
-          {data && (
-            <Group gap={6} wrap='nowrap' className='shrink-0'>
-              {data.access.source === 'user' && (
-                <Tooltip label={tExt('chat.ownKeyHint', {})}>
-                  <Badge variant='light' color='teal' leftSection={<FontAwesomeIcon icon={faKey} size='xs' />}>
-                    {tExt('chat.ownKey', {})}
-                  </Badge>
-                </Tooltip>
-              )}
-              {data.configured && (
-                <Badge variant='default' className='hidden! sm:inline-flex!' tt='none'>
-                  {data.model}
-                </Badge>
-              )}
-            </Group>
-          )}
-        </Group>
-
-        {data && (
-          <div className='px-4 py-3 empty:hidden'>
-            <Notice info={data} />
-          </div>
-        )}
-        {info.error && (
-          <Alert color='red' m='md'>
-            {httpErrorToHuman(info.error)}
-          </Alert>
-        )}
-
-        <div className='relative min-h-0 flex-1'>
-          <ScrollArea
-            h='100%'
-            viewportRef={viewport}
-            onScrollPositionChange={({ y }) => {
-              const element = viewport.current;
-              if (element) {
-                setFollowing(element.scrollHeight - (y + element.clientHeight) < STICK_DISTANCE);
-              }
-            }}
-          >
-            <div className='p-4'>
-              {loading ? (
-                <Group justify='center' py='xl'>
-                  <Loader size='sm' />
-                </Group>
-              ) : (
-                <Stack gap='lg'>
-                  {chat.messages.length === 0 && !chat.busy && (
-                    <EmptyState admin={admin} onPick={(prompt) => send(prompt)} disabled={!usable} />
-                  )}
-                  <Timeline chat={chat} titles={titles} onDecide={decide} />
-                  {chat.draft && (
-                    <AssistantBlock>
-                      <ChatMarkdown text={chat.draft} />
-                    </AssistantBlock>
-                  )}
-                  {chat.busy && !chat.draft && (
-                    <Thinking
-                      label={
-                        runningCall
-                          ? tExt('tool.running', { title: titles.get(runningCall.name) ?? runningCall.name })
-                          : tExt('chat.thinking', {})
-                      }
-                    />
-                  )}
-                  {chat.stopped && !chat.busy && (
-                    <Text size='sm' c='dimmed' ta='center'>
-                      {tExt('chat.stopped', {})}
-                    </Text>
-                  )}
-                  {chat.error && !chat.busy && (
-                    <Alert color='red' title={tExt('chat.errorTitle', {})}>
-                      <Stack gap='xs' align='flex-start'>
-                        <Text size='sm'>{chat.error}</Text>
-                        <Group gap='xs'>
-                          {selected && canContinue(chat) && (
-                            <Button
-                              size='xs'
-                              variant='default'
-                              leftSection={<FontAwesomeIcon icon={faRotateRight} />}
-                              onClick={() => runTurn(selected, 'continue', {})}
-                            >
-                              {tExt('chat.retry', {})}
-                            </Button>
-                          )}
-                          {data &&
-                            data.access.mode !== 'off' &&
-                            (data.access.source === 'user' || /\b40[13]\b|key/i.test(chat.error)) && (
-                              <Button
-                                size='xs'
-                                variant='default'
-                                onClick={() => navigate(ACCOUNT_KEY_PATH)}
-                                leftSection={<FontAwesomeIcon icon={faKey} />}
-                              >
-                                {tExt('chat.manageKey', {})}
-                              </Button>
-                            )}
-                        </Group>
-                      </Stack>
-                    </Alert>
-                  )}
-                  {selected && chat.stopped && !chat.busy && !chat.error && canContinue(chat) && (
-                    <Group justify='center'>
-                      <Button
-                        size='xs'
-                        variant='default'
-                        leftSection={<FontAwesomeIcon icon={faRotateRight} />}
-                        onClick={() => runTurn(selected, 'continue', {})}
-                      >
-                        {tExt('chat.retry', {})}
-                      </Button>
-                    </Group>
-                  )}
-                </Stack>
-              )}
-            </div>
-          </ScrollArea>
-          {!following && (
-            <ActionIcon
-              radius='xl'
-              size='lg'
-              variant='default'
-              className='absolute! bottom-3 left-1/2 -translate-x-1/2 shadow-md'
-              onClick={scrollToBottom}
-              aria-label={tExt('chat.jumpToLatest', {})}
-            >
-              <FontAwesomeIcon icon={faArrowDown} />
-            </ActionIcon>
-          )}
-        </div>
-
-        <div className='border-t border-[var(--mantine-color-default-border)] p-3'>
-          <Group align='flex-end' gap='xs' wrap='nowrap'>
-            <TextArea
-              ref={composer}
-              className='flex-1'
-              placeholder={tExt('chat.placeholder', {})}
-              value={text}
-              onChange={(event) => setText(event.currentTarget.value)}
-              onKeyDown={onKeyDown}
-              autosize
-              minRows={1}
-              maxRows={8}
-              maxLength={8000}
-              disabled={!usable || chat.busy}
-              aria-label={tExt('chat.placeholder', {})}
-            />
-            {chat.busy ? (
-              <Button color='red' variant='light' leftSection={<FontAwesomeIcon icon={faStop} />} onClick={stop}>
-                {tExt('chat.stop', {})}
-              </Button>
-            ) : (
-              <Button
-                leftSection={<FontAwesomeIcon icon={faPaperPlane} />}
-                onClick={() => send()}
-                disabled={!usable || !text.trim()}
-              >
-                {tExt('chat.send', {})}
-              </Button>
-            )}
-          </Group>
-          {usage && data?.configured && (
-            <Text size='xs' c='dimmed' mt={6} className='tabular-nums'>
-              {data.access.source === 'user'
-                ? tExt('chat.usageOwnKey', { used: usage.own_key_tokens_today.toLocaleString() })
-                : usage.daily_token_limit > 0
-                  ? tExt('chat.usage', {
-                      used: usage.tokens_today.toLocaleString(),
-                      limit: usage.daily_token_limit.toLocaleString(),
-                    })
-                  : tExt('chat.usageUnlimited', { used: usage.tokens_today.toLocaleString() })}
-              {' · '}
-              {tExt('chat.hint', {})}
-            </Text>
-          )}
-        </div>
-      </Card>
+      {card}
     </div>
   );
 }

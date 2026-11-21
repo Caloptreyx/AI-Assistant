@@ -2,6 +2,7 @@ import { z } from 'zod';
 import { axiosInstance, getImpersonatedUser } from '@/api/axios.ts';
 import { parseFromApi, serializeForApi } from '@/lib/serialization/api-transform.ts';
 import type { Action, Message } from './lib/chat.ts';
+import { CHAT_DISPLAYS } from './lib/display.ts';
 import { readSse, type SseMessage } from './lib/sse.ts';
 
 export const PACKAGE = 'dev.caloptreyx.aiassistant';
@@ -166,6 +167,7 @@ export const settingsSchema = z.object({
   instructions: z.string(),
   userKeys: z.enum(['off', 'allowed', 'required']),
   allowCustomBaseUrls: z.boolean(),
+  chatDisplay: z.enum(CHAT_DISPLAYS),
 });
 export type Settings = z.infer<typeof settingsSchema>;
 

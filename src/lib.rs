@@ -3,7 +3,8 @@ use shared::{
     State,
     extensions::{
         Extension, ExtensionPermissionsBuilder, ExtensionRouteBuilder, ExtensionUpdateInfo,
-        background_tasks::BackgroundTaskBuilder, settings::ExtensionSettingsDeserializer,
+        background_tasks::BackgroundTaskBuilder, index_html::IndexHtmlBuilder,
+        settings::ExtensionSettingsDeserializer,
     },
     permissions::PermissionGroup,
 };
@@ -82,6 +83,23 @@ impl Extension for ExtensionStruct {
                     routes::account::router(&state),
                 )
             })
+    }
+
+    /// The frontend needs the chat display before its first request, to decide which sidebar
+    /// pages and floating buttons exist. Not a secret: index.html is public.
+    async fn initialize_index_html(
+        &mut self,
+        _state: State,
+        builder: IndexHtmlBuilder,
+    ) -> IndexHtmlBuilder {
+        builder.add_variable("chat_display", |app| {
+            let display = app
+                .get_extension_settings::<settings::Settings>(PACKAGE)
+                .map(|settings| settings.chat_display)
+                .unwrap_or_default();
+            Ok(serde_json::to_value(display)?)
+        });
+        builder
     }
 
     async fn initialize_permissions(

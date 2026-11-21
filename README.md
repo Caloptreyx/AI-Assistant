@@ -9,12 +9,16 @@ Package name: `dev.caloptreyx.aiassistant` · Requires panel `>=1.2.10`
 
 ## Features
 
-- **Server chat** on every server (**AI Assistant** in the server sidebar) for users with the
-  `ai-assistant.chat` server permission. Server owners have it; give it to subusers like any other
-  permission. Each chat is bound to its server and cannot reach other servers or the admin API.
-- **Admin chat** in the admin area (**Admin → AI Assistant**) for users with the
-  `ai-assistant.chat` admin permission: nodes, users and servers overview, server tools for any
-  server, and the whole panel API through `search_api` / `describe_api` / `read_api` / `write_api`.
+- **Server chat** on every server for users with the `ai-assistant.chat` server permission. Server
+  owners have it; give it to subusers like any other permission. Each chat is bound to its server
+  and cannot reach other servers or the admin API.
+- **Admin chat** in the admin area for users with the `ai-assistant.chat` admin permission: nodes,
+  users and servers overview, server tools for any server, and the whole panel API through
+  `search_api` / `describe_api` / `read_api` / `write_api`.
+- **Page or popup window**: the chats live on an **AI Assistant** page in the server and admin
+  sidebars, in a floating window opened from a button in the bottom-right corner, or both
+  (setting *Chat display*). The window keeps its conversation while you move through the panel,
+  can be minimised, and fills the screen on phones.
 - **Streaming answers** (server-sent events) rendered as Markdown (code blocks with a copy button,
   lists, tables; raw HTML is never rendered), compact tool-call chips with their results, a Stop
   button and Retry after errors.
@@ -51,6 +55,11 @@ Open **Admin → Extensions → AI Assistant** (needs `extensions.manage`):
 | Ollama | `http://<host>:11434/v1` | none | `qwen3:8b`, `llama3.1` |
 | LM Studio | `http://<host>:1234/v1` | none | the loaded model |
 | Anthropic | (fixed) | `sk-ant-…` | `claude-sonnet-4-5`, `claude-haiku-4-5` |
+| Google Gemini | `https://generativelanguage.googleapis.com/v1beta/openai` | `AIza…` | `gemini-3.8-flash` |
+
+Gemini 3 attaches a thought signature to its tool calls and rejects the next request of the turn
+unless it comes back; the assistant stores it with the call and sends it back to Google's endpoint
+only (other providers never see it).
 
 The model must support tool (function) calling and streaming. **Test connection** sends a
 one-word request with the saved settings. Keys are write-only in the UI: the page only shows
@@ -63,6 +72,7 @@ Other settings:
 | Setting | Default | Meaning |
 |---|---|---|
 | Server chat / Admin chat | on / on | Where the assistant is offered |
+| Chat display | Page | *Page*: an **AI Assistant** page in the server and admin sidebars. *Popup window*: a chat button in the bottom-right corner of every server page and of the admin area, no sidebar page. *Both*. The button only shows for users who may use that chat. Users see a change after reloading the panel |
 | Messages per user per hour | 30 | `0` = unlimited (panel rate limiter, per user); counts messages with the user's own key too |
 | Tokens per user per day on the panel's key | 500 000 | Input + output as the provider reports them (estimated at four characters per token when it reports none), only what the panel's key paid for; `0` = unlimited |
 | Model calls per message | 8 | Tool rounds before the assistant stops and reports |

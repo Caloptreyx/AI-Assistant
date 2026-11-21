@@ -59,6 +59,12 @@ const translations = defineTranslations({
       copy: 'Copy',
       copied: 'Copied',
     },
+    popup: {
+      open: 'Open the AI assistant',
+      minimise: 'Minimise',
+      close: 'Close (the conversation stays in the list)',
+      waiting: 'AI assistant: an action waits for your confirmation',
+    },
     tool: {
       running: 'Running {title}…',
     },
@@ -127,9 +133,18 @@ const translations = defineTranslations({
         title: 'Where the assistant is available',
         serverChat: 'Server chat',
         serverChatDescription:
-          'A chat page on every server for users with the ai-assistant.chat server permission (server owners have it).',
+          'The chat on every server for users with the ai-assistant.chat server permission (server owners have it).',
         adminChat: 'Admin chat',
-        adminChatDescription: 'A chat page in the admin area for users with the ai-assistant.chat admin permission.',
+        adminChatDescription: 'The chat in the admin area for users with the ai-assistant.chat admin permission.',
+        display: 'Chat display',
+        display_page: 'Page',
+        display_popup: 'Popup window',
+        display_both: 'Both',
+        display_pageDescription: 'An “AI Assistant” page in the server and admin sidebars.',
+        display_popupDescription:
+          'A chat button in the bottom-right corner of every server page (and of the admin area) that opens the chat in a window over the panel. No sidebar page.',
+        display_bothDescription: 'The sidebar page and the chat button.',
+        displayReload: 'Users see a change after they reload the panel.',
       },
       userKeys: {
         title: 'User API keys',

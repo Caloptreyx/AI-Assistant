@@ -24,6 +24,19 @@ pub enum ProviderKind {
     Anthropic,
 }
 
+/// Where users find the chat.
+#[derive(Clone, Copy, Debug, Default, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "snake_case")]
+pub enum ChatDisplay {
+    /// A page in the server and admin sidebars (as before 0.1.1).
+    #[default]
+    Page,
+    /// A floating button that opens the chat in a window over the panel, no sidebar page.
+    Popup,
+    /// The sidebar page and the floating button.
+    Both,
+}
+
 #[derive(Clone)]
 pub struct Settings {
     pub provider: ProviderKind,
@@ -57,6 +70,8 @@ pub struct Settings {
     pub user_keys: UserKeyMode,
     /// Users may enter their own OpenAI-compatible base URL (still never a private address).
     pub allow_custom_base_urls: bool,
+    /// Sidebar page, floating window or both.
+    pub chat_display: ChatDisplay,
 }
 
 impl Default for Settings {
@@ -80,6 +95,7 @@ impl Default for Settings {
             instructions: String::new(),
             user_keys: UserKeyMode::Allowed,
             allow_custom_base_urls: false,
+            chat_display: ChatDisplay::Page,
         }
     }
 }
@@ -159,6 +175,7 @@ impl Settings {
             instructions: self.instructions.clone(),
             user_keys: self.user_keys,
             allow_custom_base_urls: self.allow_custom_base_urls,
+            chat_display: self.chat_display,
         }
     }
 }
@@ -203,6 +220,7 @@ pub struct AdminView {
     pub instructions: String,
     pub user_keys: UserKeyMode,
     pub allow_custom_base_urls: bool,
+    pub chat_display: ChatDisplay,
 }
 
 /// A settings change from the admin page. A key that is left out (or `null`) stays as it is,
@@ -231,6 +249,9 @@ pub struct Update {
     pub user_keys: UserKeyMode,
     #[serde(default)]
     pub allow_custom_base_urls: bool,
+    /// Left out by an older settings page: the page, as before.
+    #[serde(default)]
+    pub chat_display: ChatDisplay,
 }
 
 fn check_range<T: PartialOrd + std::fmt::Display>(
@@ -353,6 +374,7 @@ impl Update {
         settings.instructions = self.instructions.trim().to_string();
         settings.user_keys = self.user_keys;
         settings.allow_custom_base_urls = self.allow_custom_base_urls;
+        settings.chat_display = self.chat_display;
     }
 }
 
@@ -379,6 +401,7 @@ impl SettingsSerializeExt for Settings {
             .write_serde_setting("instructions", &self.instructions)?
             .write_serde_setting("user_keys", &self.user_keys)?
             .write_serde_setting("allow_custom_base_urls", &self.allow_custom_base_urls)?
+            .write_serde_setting("chat_display", &self.chat_display)?
             .write_raw_encrypted_setting("openai_api_key", self.openai_api_key.as_str())
             .await?
             .write_raw_encrypted_setting("anthropic_api_key", self.anthropic_api_key.as_str())
@@ -436,6 +459,7 @@ impl SettingsDeserializeExt for SettingsDataDeserializer {
             instructions: serde_or!("instructions", d.instructions),
             user_keys: serde_or!("user_keys", d.user_keys),
             allow_custom_base_urls: serde_or!("allow_custom_base_urls", d.allow_custom_base_urls),
+            chat_display: serde_or!("chat_display", d.chat_display),
         }))
     }
 }
@@ -472,6 +496,7 @@ mod tests {
             instructions: String::new(),
             user_keys: UserKeyMode::Required,
             allow_custom_base_urls: true,
+            chat_display: ChatDisplay::Both,
         }
     }
 
@@ -525,6 +550,7 @@ mod tests {
         assert_eq!(settings.openai_model, "openai/gpt-4o");
         assert_eq!(settings.user_keys, UserKeyMode::Required);
         assert!(settings.allow_custom_base_urls);
+        assert_eq!(settings.chat_display, ChatDisplay::Both);
         let provider = settings.provider().unwrap();
         assert_eq!(provider.url, "https://openrouter.ai/api/v1/chat/completions");
     }
@@ -537,6 +563,46 @@ mod tests {
         change.openai_api_key = Some("two words".into());
         let errors = change.validate().unwrap_err();
         assert_eq!(errors.len(), 3, "{errors:?}");
+    }
+
+    #[test]
+    fn the_chat_display_defaults_to_the_page_and_only_takes_known_values() {
+        assert_eq!(Settings::default().chat_display, ChatDisplay::Page);
+        assert_eq!(Settings::default().admin_view().chat_display, ChatDisplay::Page);
+
+        let mut body = serde_json::json!({
+            "provider": "openai",
+            "openai_base_url": DEFAULT_OPENAI_BASE_URL,
+            "openai_model": DEFAULT_OPENAI_MODEL,
+            "anthropic_model": DEFAULT_ANTHROPIC_MODEL,
+            "server_chat_enabled": true,
+            "admin_chat_enabled": true,
+            "requests_per_hour": 30,
+            "daily_token_limit": 0,
+            "max_tool_steps": 8,
+            "max_output_tokens": 4096,
+            "tool_output_limit": 12000,
+            "history_limit": 60,
+            "retention_days": 30,
+            "user_keys": "allowed",
+        });
+        // A settings page from before 0.1.1 sends no display: the page stays.
+        let update: Update = serde_json::from_value(body.clone()).unwrap();
+        assert_eq!(update.chat_display, ChatDisplay::Page);
+
+        for (value, expected) in [
+            ("page", ChatDisplay::Page),
+            ("popup", ChatDisplay::Popup),
+            ("both", ChatDisplay::Both),
+        ] {
+            body["chat_display"] = serde_json::json!(value);
+            let update: Update = serde_json::from_value(body.clone()).unwrap();
+            assert_eq!(update.chat_display, expected);
+            assert_eq!(serde_json::to_value(expected).unwrap(), serde_json::json!(value));
+        }
+
+        body["chat_display"] = serde_json::json!("sidebar");
+        assert!(serde_json::from_value::<Update>(body).is_err());
     }
 
     #[test]
