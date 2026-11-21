@@ -12,6 +12,10 @@ pub struct ToolCall {
     /// The arguments as the model sent them: normally an object, a string when the model sent
     /// JSON that does not parse.
     pub arguments: Value,
+    /// Provider data that has to go back with the call in later requests: the `extra_content`
+    /// with the thought signature that Gemini's OpenAI-compatible endpoint attaches to calls.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub extra: Option<Value>,
 }
 
 #[derive(Clone, Debug, PartialEq, Serialize, Deserialize)]
@@ -128,6 +132,7 @@ mod tests {
             id: id.into(),
             name: "read_console".into(),
             arguments: json!({}),
+            extra: None,
         }
     }
 
@@ -151,6 +156,24 @@ mod tests {
         }
         let text = serde_json::to_value(user("hi")).unwrap();
         assert_eq!(text, json!({ "type": "user", "text": "hi" }));
+    }
+
+    #[test]
+    fn calls_keep_provider_data_and_older_calls_still_read() {
+        let mut call = call("a");
+        call.extra = Some(json!({ "google": { "thought_signature": "c2ln" } }));
+        let entry = Entry::Assistant {
+            text: String::new(),
+            tool_calls: vec![call],
+        };
+        let stored = serde_json::to_string(&entry).unwrap();
+        assert_eq!(serde_json::from_str::<Entry>(&stored).unwrap(), entry);
+
+        // Rows written before `extra` existed read fine, and calls without it store as before.
+        let old = json!({ "type": "assistant", "text": "", "tool_calls": [{ "id": "a", "name": "read_console", "arguments": {} }] });
+        let entry: Entry = serde_json::from_value(old.clone()).unwrap();
+        assert_eq!(entry, assistant(&["a"]));
+        assert_eq!(serde_json::to_value(&entry).unwrap(), old);
     }
 
     #[test]

@@ -192,11 +192,26 @@ impl StreamReader {
 impl Provider {
     pub fn body(&self, system: &str, history: &[Entry], tools: &[ToolSpec]) -> Value {
         match self.kind {
-            ProviderKind::Openai => openai::body(&self.model, system, history, tools),
+            ProviderKind::Openai => {
+                openai::body(&self.model, system, history, tools, self.is_google())
+            }
             ProviderKind::Anthropic => {
                 anthropic::body(&self.model, self.max_tokens, system, history, tools)
             }
         }
+    }
+
+    /// Google's OpenAI-compatible Gemini endpoints (AI Studio, Vertex AI), which need the
+    /// thought signatures of tool calls back.
+    pub fn is_google(&self) -> bool {
+        let host = url::Url::parse(&self.url)
+            .ok()
+            .and_then(|url| url.host_str().map(str::to_ascii_lowercase))
+            .unwrap_or_default();
+        self.kind == ProviderKind::Openai
+            && (host == "generativelanguage.googleapis.com"
+                || host == "aiplatform.googleapis.com"
+                || host.ends_with("-aiplatform.googleapis.com"))
     }
 
     fn request(&self, body: &Value) -> Result<reqwest::RequestBuilder, String> {

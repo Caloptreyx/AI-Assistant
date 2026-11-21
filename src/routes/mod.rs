@@ -534,6 +534,7 @@ async fn store_result(
         id: action.call_id.clone(),
         name: action.tool.clone(),
         arguments: action.arguments.clone(),
+        extra: None,
     };
     Ok(db::append(&state.database, conversation, Entry::tool_result(&call, outcome)).await?)
 }

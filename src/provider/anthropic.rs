@@ -232,6 +232,7 @@ impl Parser {
                     id,
                     name,
                     arguments: parse_arguments(&json),
+                    extra: None,
                 }),
                 _ => None,
             })

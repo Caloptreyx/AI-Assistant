@@ -1,0 +1,6 @@
+data: {"choices":[{"delta":{"content":"The server crashed because it ran out of memory","role":"assistant"},"index":0}],"created":1763700004,"id":"pFkgaZbcC9mqvdIP2bq6oQk","model":"gemini-3.8-flash","object":"chat.completion.chunk"}
+
+data: {"choices":[{"delta":{"content":" at 04:12.","extra_content":{"google":{"thought_signature":"Cs4BAdHtim9hbnN3ZXItc2lnbmF0dXJlLWZvci10ZXN0cw=="}},"role":"assistant"},"finish_reason":"stop","index":0}],"created":1763700004,"id":"pFkgaZbcC9mqvdIP2bq6oQk","model":"gemini-3.8-flash","object":"chat.completion.chunk","usage":{"completion_tokens":17,"prompt_tokens":2391,"total_tokens":2408}}
+
+data: [DONE]
+

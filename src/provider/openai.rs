@@ -1,9 +1,14 @@
-//! OpenAI-compatible chat completions (OpenAI, OpenRouter, Groq, Ollama, LM Studio, vLLM, ...).
+//! OpenAI-compatible chat completions (OpenAI, OpenRouter, Groq, Gemini, Ollama, LM Studio, vLLM,
+//! ...).
 
 use super::{Completion, ToolSpec, Usage, error_message, parse_arguments, sse::SseEvent};
 use crate::chat::entry::{Entry, ToolCall};
 use serde_json::{Value, json};
 use std::collections::BTreeMap;
+
+/// Google's documented stand-in for a missing thought signature, for calls Gemini did not make
+/// itself (another model earlier in the same conversation).
+const SKIP_SIGNATURE: &str = "skip_thought_signature_validator";
 
 fn arguments_text(arguments: &Value) -> String {
     match arguments {
@@ -12,7 +17,39 @@ fn arguments_text(arguments: &Value) -> String {
     }
 }
 
-pub fn body(model: &str, system: &str, history: &[Entry], tools: &[ToolSpec]) -> Value {
+/// One call of an assistant message in OpenAI's shape. For Gemini (`google`) it carries the
+/// `extra_content` with the thought signature Gemini attached to it: Gemini 3 rejects the next
+/// request of a tool-using turn with a 400 when the first call of a step comes back without it.
+/// Other servers never see that field.
+fn tool_call(call: &ToolCall, first: bool, google: bool) -> Value {
+    let mut out = json!({
+        "id": call.id,
+        "type": "function",
+        "function": {
+            "name": call.name,
+            "arguments": arguments_text(&call.arguments),
+        },
+    });
+    if google {
+        match &call.extra {
+            Some(extra) => out["extra_content"] = extra.clone(),
+            None if first => {
+                out["extra_content"] =
+                    json!({ "google": { "thought_signature": SKIP_SIGNATURE } });
+            }
+            None => {}
+        }
+    }
+    out
+}
+
+pub fn body(
+    model: &str,
+    system: &str,
+    history: &[Entry],
+    tools: &[ToolSpec],
+    google: bool,
+) -> Value {
     let mut messages = vec![json!({ "role": "system", "content": system })];
     for entry in history {
         messages.push(match entry {
@@ -27,16 +64,8 @@ pub fn body(model: &str, system: &str, history: &[Entry], tools: &[ToolSpec]) ->
                 if !tool_calls.is_empty() {
                     message["tool_calls"] = tool_calls
                         .iter()
-                        .map(|call| {
-                            json!({
-                                "id": call.id,
-                                "type": "function",
-                                "function": {
-                                    "name": call.name,
-                                    "arguments": arguments_text(&call.arguments),
-                                },
-                            })
-                        })
+                        .enumerate()
+                        .map(|(position, call)| tool_call(call, position == 0, google))
                         .collect();
                 }
                 message
@@ -86,6 +115,7 @@ struct PartialCall {
     id: String,
     name: String,
     arguments: String,
+    extra: Option<Value>,
 }
 
 #[derive(Default)]
@@ -182,6 +212,9 @@ impl Parser {
                 _ => {}
             }
         }
+        if let Some(extra) = call.get("extra_content").filter(|extra| extra.is_object()) {
+            entry.extra = Some(extra.clone());
+        }
     }
 
     pub fn finish(self) -> Completion {
@@ -198,6 +231,7 @@ impl Parser {
                 },
                 name: call.name,
                 arguments: parse_arguments(&call.arguments),
+                extra: call.extra,
             })
             .collect();
         Completion {
