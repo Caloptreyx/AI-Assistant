@@ -35,6 +35,21 @@ Package name: `dev.caloptreyx.aiassistant` · Requires panel `>=1.2.10`
 - Conversations are kept per user (and per server) in the panel database and can be renamed and
   deleted.
 
+## Screenshots
+
+**Server chat**: the assistant reads the server's files and proposes a restart as an action card
+that only runs after **Confirm**.
+
+![Server chat with a restart action card waiting for confirmation](docs/screenshots/server-chat.png)
+
+**Admin settings**: bring-your-own-key mode, where the chat is available and the guardrails.
+
+![AI Assistant admin settings](docs/screenshots/admin-settings.png)
+
+**Account → AI Assistant**: users add their own provider key.
+
+![Account page for adding your own API key](docs/screenshots/account-key.png)
+
 ## Installation
 
 Download `dev_caloptreyx_aiassistant.c7s.zip` from the
