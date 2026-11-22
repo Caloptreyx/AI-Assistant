@@ -2,7 +2,7 @@
 name = "dev_caloptreyx_aiassistant"
 description = "AI assistant chat for Calagopus Panel: answers questions and acts on servers with the user's own permissions, asking before every change."
 authors = ["Caloptreyx"]
-version = "0.1.1"
+version = "0.1.2"
 edition = { workspace = true }
 
 [dependencies]

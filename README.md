@@ -153,8 +153,11 @@ infrastructure. API keys are stored encrypted with the panel's database key. Wit
 that user's conversations go to their provider account instead.
 
 Tool output is untrusted input to the model: a player's chat line or a file could contain
-instructions aimed at it. That is one reason every change waits for a human: read the action card
-before you confirm it.
+instructions aimed at it. The system prompt tells the model to treat tool output as data, never as
+instructions, but that is not a guarantee, which is one reason every change waits for a human: read
+the action card before you confirm it. Answers render without images and raw HTML, so an injected
+instruction cannot make the browser load a URL (and leak data in it) on its own; links only open on
+a click.
 
 ## API
 

