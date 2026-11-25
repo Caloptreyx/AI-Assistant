@@ -26,6 +26,12 @@ Package name: `dev.caloptreyx.aiassistant` · Requires panel `>=1.2.10`
   backups, schedules, startup variables, admin API writes) is shown as a card with a plain-language
   summary, the raw arguments one click away, and red styling for destructive changes. Rejected
   actions go back to the model as rejected.
+- **Automatic snapshots & rollback**: before running reversible changes (`write_file`, `edit_file`,
+  `delete_files`, `update_startup_variables`, `rename_server`, `create_schedule`), the assistant
+  snapshots the previous state (up to 1 MB per file, 2 MB per delete batch). Undo individual actions
+  or roll back everything back to a checkpoint from the action card, with conflict detection (and
+  explicit force override) if a resource changed afterwards, permission and server-scope checks, and
+  automatic AI conversation context sync.
 - **Providers**: any OpenAI-compatible chat completions API (OpenAI, OpenRouter, Groq, Ollama,
   LM Studio, vLLM, …) or Anthropic. API keys are stored encrypted and never leave the backend.
 - **Bring your own key**: users can add their own provider key under **Account → AI Assistant**;
@@ -56,7 +62,7 @@ Download `dev_caloptreyx_aiassistant.c7s.zip` from the
 [latest release](https://github.com/Caloptreyx/AI-Assistant/releases/latest) and either upload it
 under **Admin → Extensions** or drop it into your heavy image's `build/extensions/` directory and
 `docker compose restart web`. Extensions require the `:heavy` panel image (or a dev environment).
-The migrations create five tables prefixed `dev_caloptreyx_aiassistant_`.
+The migrations create six tables prefixed `dev_caloptreyx_aiassistant_`.
 
 ## Setup
 
@@ -189,6 +195,8 @@ Server chat: `/api/client/servers/{server}/ai-assistant`, admin chat:
 | POST | `/conversations/{conversation}/stop` | Stop the running answer |
 | POST | `/conversations/{conversation}/actions/{action}/confirm` | Run a pending action |
 | POST | `/conversations/{conversation}/actions/{action}/reject` | `{ "reason": "…" }` optional |
+| POST | `/conversations/{conversation}/actions/{action}/rollback` | `{ "force": false }` optional; undo one action (409 on conflict) |
+| POST | `/conversations/{conversation}/actions/{action}/rollback-to` | `{ "force": false }` optional; undo reversible actions at or after this checkpoint |
 
 Stream events: `message` (a stored entry), `delta` (answer text), `tool` (a read tool started),
 `action` (a proposed change), `error`, `stopped`, `done` (`{ "waiting": true }` while actions wait).
