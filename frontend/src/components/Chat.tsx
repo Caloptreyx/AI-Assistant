@@ -39,6 +39,10 @@ import {
   getInfo,
   PACKAGE,
   renameConversation,
+  type RollbackActionResult,
+  type RollbackToResult,
+  rollbackAction,
+  rollbackToAction,
   stopTurn,
   streamTurn,
 } from '../api.ts';
@@ -49,8 +53,9 @@ import {
   canContinue,
   emptyChat,
   loadedChat,
-  upsertAction,
   pendingActions,
+  upsertAction,
+  upsertActions,
   withMessage,
 } from '../lib/chat.ts';
 import { useExtTranslations } from '../translations.ts';
@@ -186,6 +191,7 @@ export default function Chat({
   const [selected, setSelected] = useState<string | null>(null);
   const [chat, setChat] = useState<ChatState>(emptyChat);
   const [loading, setLoading] = useState(false);
+  const [rollingBack, setRollingBack] = useState(false);
   const [text, setText] = useState('');
   const [listOpen, setListOpen] = useState(false);
   const [following, setFollowing] = useState(true);
@@ -333,6 +339,74 @@ export default function Chat({
     }
   };
 
+  const rollback = async (action: Action, force: boolean): Promise<RollbackActionResult | null> => {
+    if (!selected) {
+      return null;
+    }
+    const conversation = selected;
+    setRollingBack(true);
+    try {
+      const result = await rollbackAction(base, conversation, action.uuid, force);
+      if (result.ok) {
+        setChat((state) => ({ ...state, actions: upsertAction(state.actions, result.action) }));
+        if (result.action.rollback_status === 'rolled_back') {
+          queryClient.invalidateQueries();
+          onChanged?.();
+          addToast(tExt('action.rollbackSuccess', {}), 'success');
+        } else if (result.action.rollback_status === 'failed') {
+          addToast(result.action.rollback_result ?? tExt('action.rollbackFailed', {}), 'error');
+        }
+      }
+      return result;
+    } catch (error) {
+      addToast(httpErrorToHuman(error), 'error');
+      load(conversation);
+      return null;
+    } finally {
+      setRollingBack(false);
+    }
+  };
+
+  const rollbackTo = async (action: Action, force: boolean): Promise<RollbackToResult | null> => {
+    if (!selected) {
+      return null;
+    }
+    const conversation = selected;
+    setRollingBack(true);
+    try {
+      const result = await rollbackToAction(base, conversation, action.uuid, force);
+      if (result.actions.length > 0) {
+        setChat((state) => ({ ...state, actions: upsertActions(state.actions, result.actions) }));
+        queryClient.invalidateQueries();
+        onChanged?.();
+      }
+      if (result.ok) {
+        const succeededCount = result.actions.filter((item) => item.rollback_status === 'rolled_back').length;
+        const failedItem = result.actions.find((item) => item.rollback_status === 'failed');
+        if (failedItem) {
+          addToast(failedItem.rollback_result ?? tExt('action.rollbackFailed', {}), 'error');
+        } else if (result.skipped.length > 0) {
+          addToast(
+            tExt('action.rollbackToPartial', {
+              count: String(succeededCount),
+              skipped: String(result.skipped.length),
+            }),
+            'success',
+          );
+        } else if (succeededCount > 0) {
+          addToast(tExt('action.rollbackToSuccess', { count: String(succeededCount) }), 'success');
+        }
+      }
+      return result;
+    } catch (error) {
+      addToast(httpErrorToHuman(error), 'error');
+      load(conversation);
+      return null;
+    } finally {
+      setRollingBack(false);
+    }
+  };
+
   const rename = async (conversation: Conversation, title: string) => {
     try {
       await renameConversation(base, conversation.uuid, title);
@@ -471,7 +545,14 @@ export default function Chat({
                 {chat.messages.length === 0 && !chat.busy && (
                   <EmptyState admin={admin} onPick={(prompt) => send(prompt)} disabled={!usable} compact={popup} />
                 )}
-                <Timeline chat={chat} titles={titles} onDecide={decide} />
+                <Timeline
+                  chat={chat}
+                  titles={titles}
+                  onDecide={decide}
+                  onRollback={rollback}
+                  onRollbackTo={rollbackTo}
+                  disabled={rollingBack}
+                />
                 {chat.draft && (
                   <AssistantBlock>
                     <ChatMarkdown text={chat.draft} />

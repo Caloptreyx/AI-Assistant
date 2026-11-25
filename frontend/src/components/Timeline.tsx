@@ -4,8 +4,10 @@ import {
   faChevronDown,
   faChevronRight,
   faCircleExclamation,
+  faClockRotateLeft,
   faHand,
   faRobot,
+  faRotateLeft,
   faTriangleExclamation,
   faXmark,
 } from '@fortawesome/free-solid-svg-icons';
@@ -16,14 +18,24 @@ import Button from '@/elements/buttons/Button.tsx';
 import Badge from '@/elements/data-display/Badge.tsx';
 import Card from '@/elements/data-display/Card.tsx';
 import ThemeIcon from '@/elements/data-display/ThemeIcon.tsx';
+import Alert from '@/elements/feedback/Alert.tsx';
 import Collapse from '@/elements/layout/Collapse.tsx';
 import Group from '@/elements/layout/Group.tsx';
 import Paper from '@/elements/layout/Paper.tsx';
 import Stack from '@/elements/layout/Stack.tsx';
 import Code from '@/elements/typography/Code.tsx';
 import Text from '@/elements/typography/Text.tsx';
+import type { RollbackActionResult, RollbackToResult } from '../api.ts';
 import { describeAction } from '../lib/actions.ts';
-import { type Action, type CallView, type ChatState, callView, type ToolCall } from '../lib/chat.ts';
+import {
+  type Action,
+  type CallView,
+  type ChatState,
+  callView,
+  canRollback,
+  rollbackableToAction,
+  type ToolCall,
+} from '../lib/chat.ts';
 import { useExtTranslations } from '../translations.ts';
 import ChatMarkdown from './Markdown.tsx';
 
@@ -81,20 +93,32 @@ const STATUS: Record<Action['status'], { color: string; icon: typeof faCheck | n
 
 function ActionCard({
   action,
+  allActions,
   onDecide,
+  onRollback,
+  onRollbackTo,
   disabled,
 }: {
   action: Action;
+  allActions: Action[];
   onDecide: (action: Action, confirm: boolean) => Promise<void>;
+  onRollback: (action: Action, force: boolean) => Promise<RollbackActionResult | null>;
+  onRollbackTo: (action: Action, force: boolean) => Promise<RollbackToResult | null>;
   disabled: boolean;
 }) {
   const { t: tExt } = useExtTranslations();
   const [deciding, setDeciding] = useState<'confirm' | 'reject' | null>(null);
+  const [rolling, setRolling] = useState<'one' | 'to' | null>(null);
+  const [conflict, setConflict] = useState<{ mode: 'one' | 'to'; message: string } | null>(null);
   const [raw, setRaw] = useState(false);
   const described = describeAction(action.tool, action.arguments);
   const status = STATUS[action.status];
   const pending = action.status === 'pending';
   const danger = described.danger && (pending || action.status === 'running');
+  const rolledBack = action.rollback_status === 'rolled_back';
+  const rollingBack = action.rollback_status === 'rolling_back' || rolling !== null;
+  const reversible = canRollback(action);
+  const plan = reversible ? rollbackableToAction(allActions, action.uuid) : null;
 
   const decide = async (confirm: boolean) => {
     setDeciding(confirm ? 'confirm' : 'reject');
@@ -102,6 +126,20 @@ function ActionCard({
       await onDecide(action, confirm);
     } finally {
       setDeciding(null);
+    }
+  };
+
+  const runRollback = async (mode: 'one' | 'to', force: boolean) => {
+    setRolling(mode);
+    try {
+      const result = mode === 'one' ? await onRollback(action, force) : await onRollbackTo(action, force);
+      if (!result || result.ok) {
+        setConflict(null);
+      } else if (result.conflict) {
+        setConflict({ mode, message: result.message });
+      }
+    } finally {
+      setRolling(null);
     }
   };
 
@@ -122,16 +160,31 @@ function ActionCard({
               {described.summary}
             </Text>
           </div>
-          <Badge
-            color={status.color}
-            variant='light'
-            leftSection={
-              status.icon ? <FontAwesomeIcon icon={status.icon} size='xs' /> : <Loader size={10} color='blue' />
-            }
-            className='shrink-0'
-          >
-            {tExt(`action.${action.status}`, {})}
-          </Badge>
+          {rolledBack ? (
+            <Badge
+              color='violet'
+              variant='light'
+              leftSection={<FontAwesomeIcon icon={faRotateLeft} size='xs' />}
+              className='shrink-0'
+            >
+              {tExt('action.rolledBack', {})}
+            </Badge>
+          ) : rollingBack ? (
+            <Badge color='blue' variant='light' leftSection={<Loader size={10} color='blue' />} className='shrink-0'>
+              {tExt('action.rollingBack', {})}
+            </Badge>
+          ) : (
+            <Badge
+              color={status.color}
+              variant='light'
+              leftSection={
+                status.icon ? <FontAwesomeIcon icon={status.icon} size='xs' /> : <Loader size={10} color='blue' />
+              }
+              className='shrink-0'
+            >
+              {tExt(`action.${action.status}`, {})}
+            </Badge>
+          )}
         </Group>
 
         {danger && (
@@ -184,6 +237,24 @@ function ActionCard({
           </Paper>
         )}
 
+        {action.rollback_result && (
+          <Paper
+            withBorder
+            p='xs'
+            radius='sm'
+            className={action.rollback_status === 'failed' ? 'border-red-500/50!' : undefined}
+          >
+            <Text size='xs' c={action.rollback_status === 'failed' ? 'red' : 'dimmed'} mb={4}>
+              {action.rollback_status === 'failed'
+                ? tExt('action.rollbackFailed', {})
+                : tExt('action.rollbackResult', {})}
+            </Text>
+            <Code block className={OUTPUT_CLASS}>
+              {readable(action.rollback_result)}
+            </Code>
+          </Paper>
+        )}
+
         {pending && (
           <Group justify='flex-end' gap='xs'>
             <Button
@@ -205,6 +276,78 @@ function ActionCard({
               {danger ? tExt('action.confirmDanger', {}) : tExt('action.confirm', {})}
             </Button>
           </Group>
+        )}
+
+        {reversible && (
+          <Stack gap='xs'>
+            {action.rollback_summary && (
+              <Text size='xs' c='dimmed'>
+                {action.rollback_summary}
+              </Text>
+            )}
+            {conflict && (
+              <Alert
+                color='yellow'
+                icon={<FontAwesomeIcon icon={faTriangleExclamation} />}
+                title={tExt('action.rollbackConflictTitle', {})}
+              >
+                <Stack gap='xs'>
+                  <Text size='sm'>{conflict.message}</Text>
+                  <Group gap='xs'>
+                    <Button
+                      size='xs'
+                      color='yellow'
+                      leftSection={<FontAwesomeIcon icon={faRotateLeft} size='xs' />}
+                      loading={rolling !== null}
+                      disabled={disabled || rolling !== null}
+                      onClick={() => runRollback(conflict.mode, true)}
+                    >
+                      {tExt('action.forceRollback', {})}
+                    </Button>
+                    <Button size='xs' variant='default' disabled={rolling !== null} onClick={() => setConflict(null)}>
+                      {tExt('action.cancel', {})}
+                    </Button>
+                  </Group>
+                </Stack>
+              </Alert>
+            )}
+            <Group justify='flex-end' gap='xs' wrap='wrap'>
+              {plan && plan.reversible.length > 1 && (
+                <Button
+                  size='xs'
+                  variant='default'
+                  leftSection={<FontAwesomeIcon icon={faClockRotateLeft} size='xs' />}
+                  loading={rolling === 'to'}
+                  disabled={disabled || rolling !== null}
+                  onClick={() => runRollback('to', false)}
+                >
+                  {tExt('action.rollbackTo', { count: String(plan.reversible.length) })}
+                </Button>
+              )}
+              <Button
+                size='xs'
+                variant='light'
+                color='orange'
+                leftSection={<FontAwesomeIcon icon={faRotateLeft} size='xs' />}
+                loading={rolling === 'one'}
+                disabled={disabled || rolling !== null}
+                onClick={() => runRollback('one', false)}
+              >
+                {action.rollback_status === 'failed' ? tExt('action.retryRollback', {}) : tExt('action.rollback', {})}
+              </Button>
+            </Group>
+            {plan && plan.reversible.length > 1 && plan.irreversible.length > 0 && (
+              <Text size='xs' c='dimmed' ta='right'>
+                {tExt('action.rollbackToSkippedHint', { count: String(plan.irreversible.length) })}
+              </Text>
+            )}
+          </Stack>
+        )}
+
+        {action.status === 'succeeded' && action.rollback_status === 'unavailable' && (
+          <Text size='xs' c='dimmed'>
+            {action.rollback_summary ?? tExt('action.rollbackUnavailable', {})}
+          </Text>
         )}
       </Stack>
     </Card>
@@ -261,12 +404,18 @@ function AssistantMessage({
   chat,
   titles,
   onDecide,
+  onRollback,
+  onRollbackTo,
+  disabled,
 }: {
   text: string;
   calls: ToolCall[];
   chat: ChatState;
   titles: Map<string, string>;
   onDecide: (action: Action, confirm: boolean) => Promise<void>;
+  onRollback: (action: Action, force: boolean) => Promise<RollbackActionResult | null>;
+  onRollbackTo: (action: Action, force: boolean) => Promise<RollbackToResult | null>;
+  disabled: boolean;
 }) {
   const views = calls.map((call) => callView(chat, call));
   const tools = views.filter((view): view is Exclude<CallView, { kind: 'action' }> => view.kind !== 'action');
@@ -278,7 +427,15 @@ function AssistantMessage({
         {text.trim() && <ChatMarkdown text={text} />}
         {tools.length > 0 && <ToolCalls views={tools} titles={titles} />}
         {actions.map((view) => (
-          <ActionCard key={view.call.id} action={view.action} onDecide={onDecide} disabled={chat.busy} />
+          <ActionCard
+            key={view.call.id}
+            action={view.action}
+            allActions={chat.actions}
+            onDecide={onDecide}
+            onRollback={onRollback}
+            onRollbackTo={onRollbackTo}
+            disabled={disabled}
+          />
         ))}
       </Stack>
     </AssistantBlock>
@@ -289,10 +446,16 @@ export default function Timeline({
   chat,
   titles,
   onDecide,
+  onRollback,
+  onRollbackTo,
+  disabled = false,
 }: {
   chat: ChatState;
   titles: Map<string, string>;
   onDecide: (action: Action, confirm: boolean) => Promise<void>;
+  onRollback: (action: Action, force: boolean) => Promise<RollbackActionResult | null>;
+  onRollbackTo: (action: Action, force: boolean) => Promise<RollbackToResult | null>;
+  disabled?: boolean;
 }) {
   return (
     <Stack gap='lg'>
@@ -309,6 +472,9 @@ export default function Timeline({
               chat={chat}
               titles={titles}
               onDecide={onDecide}
+              onRollback={onRollback}
+              onRollbackTo={onRollbackTo}
+              disabled={chat.busy || disabled}
             />
           );
         }

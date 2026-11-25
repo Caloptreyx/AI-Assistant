@@ -18,7 +18,7 @@ use entry::Entry;
 use serde_json::json;
 use shared::{State, models::user::PermissionManager};
 use std::{
-    collections::HashMap,
+    collections::{HashMap, HashSet},
     sync::{Arc, LazyLock, Mutex},
 };
 use tokio::sync::mpsc::UnboundedSender;
@@ -34,7 +34,7 @@ pub enum Event {
     /// A read tool started.
     Tool { call_id: String, name: String },
     /// The model proposed a change; it waits for the user.
-    Action(db::Action),
+    Action(Box<db::Action>),
     Error(String),
     /// The user stopped the turn.
     Stopped,
@@ -149,6 +149,82 @@ fn internal(err: impl std::fmt::Display) -> String {
     "The assistant hit an internal error; see the panel log.".into()
 }
 
+/// Annotates the in-memory history and system prompt with actions the user later rolled back,
+/// without mutating stored messages or breaking provider turn ordering.
+pub(crate) fn apply_rollback_context(
+    system: &str,
+    history: Vec<Entry>,
+    actions: &[db::Action],
+) -> (String, Vec<Entry>) {
+    let rolled_back: Vec<&db::Action> = actions
+        .iter()
+        .filter(|action| action.rollback_status == "rolled_back")
+        .collect();
+    if rolled_back.is_empty() {
+        return (system.to_string(), history);
+    }
+
+    let by_call_id: HashMap<&str, &db::Action> = rolled_back
+        .iter()
+        .map(|action| (action.call_id.as_str(), *action))
+        .collect();
+    let mut annotated: HashSet<String> = HashSet::new();
+
+    let history = history
+        .into_iter()
+        .map(|entry| match entry {
+            Entry::ToolResult {
+                call_id,
+                name,
+                mut content,
+                is_error,
+            } => {
+                if let Some(action) = by_call_id.get(call_id.as_str()) {
+                    annotated.insert(call_id.clone());
+                    let detail = action
+                        .rollback_result
+                        .as_deref()
+                        .filter(|text| !text.is_empty())
+                        .unwrap_or("reverted to previous state");
+                    content.push_str(&format!(
+                        "\n\n[Note: the user later rolled back this action: {detail}]"
+                    ));
+                }
+                Entry::ToolResult {
+                    call_id,
+                    name,
+                    content,
+                    is_error,
+                }
+            }
+            other => other,
+        })
+        .collect();
+
+    let out_of_window: Vec<&db::Action> = rolled_back
+        .into_iter()
+        .filter(|action| !annotated.contains(&action.call_id))
+        .collect();
+    let mut out_system = system.to_string();
+    if !out_of_window.is_empty() {
+        out_system.push_str(
+            "\n\nEarlier actions in this conversation that the user later rolled back (do not assume these changes are still active):",
+        );
+        for action in out_of_window {
+            let detail = action
+                .rollback_result
+                .as_deref()
+                .or(action.rollback_summary.as_deref())
+                .filter(|text| !text.is_empty())
+                .unwrap_or("rolled back");
+            out_system.push_str(&format!("\n- {} ({}): {}", action.title, action.tool, detail));
+        }
+        out_system.push('\n');
+    }
+
+    (out_system, history)
+}
+
 /// Returns whether actions now wait for the user.
 async fn steps(turn: &Turn, events: &UnboundedSender<Event>) -> Result<bool, String> {
     let permissions: &dyn Permissions = &turn.permissions;
@@ -170,8 +246,12 @@ async fn steps(turn: &Turn, events: &UnboundedSender<Event>) -> Result<bool, Str
             history,
             turn.settings.history_limit.max(4) as usize,
         ));
+        let actions = db::actions(&turn.state.database, turn.conversation)
+            .await
+            .map_err(internal)?;
+        let (system, history) = apply_rollback_context(&turn.system, history, &actions);
 
-        let body = turn.provider.body(&turn.system, &history, &specs);
+        let body = turn.provider.body(&system, &history, &specs);
         let completion = turn
             .provider
             .complete(&body, |text| {
@@ -247,7 +327,7 @@ async fn steps(turn: &Turn, events: &UnboundedSender<Event>) -> Result<bool, Str
                     let action = db::create_action(&turn.state.database, turn.conversation, call)
                         .await
                         .map_err(internal)?;
-                    let _ = events.send(Event::Action(action));
+                    let _ = events.send(Event::Action(Box::new(action)));
                     waiting = true;
                 }
             }
@@ -260,4 +340,131 @@ async fn steps(turn: &Turn, events: &UnboundedSender<Event>) -> Result<bool, Str
     Err(format!(
         "The assistant stopped after {max_steps} steps in a row. Send a message to let it continue."
     ))
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use chrono::Utc;
+    use entry::ToolCall;
+
+    fn sample_action(
+        seq: i64,
+        call_id: &str,
+        tool: &str,
+        rollback_status: &str,
+        rollback_result: Option<&str>,
+    ) -> db::Action {
+        db::Action {
+            uuid: Uuid::new_v4(),
+            seq,
+            call_id: call_id.into(),
+            tool: tool.into(),
+            title: crate::tools::find(tool)
+                .map(|t| t.title.to_string())
+                .unwrap_or_else(|| tool.into()),
+            arguments: json!({}),
+            status: "succeeded".into(),
+            result: Some("ok".into()),
+            created: Utc::now(),
+            decided: Some(Utc::now()),
+            rollback_status: rollback_status.into(),
+            rollback_summary: None,
+            rollback_result: rollback_result.map(str::to_string),
+            rolled_back: (rollback_status == "rolled_back").then(Utc::now),
+        }
+    }
+
+    fn tool_call(id: &str, name: &str) -> ToolCall {
+        ToolCall {
+            id: id.into(),
+            name: name.into(),
+            arguments: json!({}),
+            extra: None,
+        }
+    }
+
+    #[test]
+    fn apply_rollback_context_annotates_in_window_and_out_of_window_actions() {
+        let actions = vec![
+            // Out of window (its ToolResult was trimmed by history_limit)
+            sample_action(
+                1,
+                "call_old",
+                "rename_server",
+                "rolled_back",
+                Some("Restored server name to \"Survival\"."),
+            ),
+            // In window and rolled back
+            sample_action(
+                2,
+                "call_recent",
+                "edit_file",
+                "rolled_back",
+                Some("Restored /server.properties to its previous contents."),
+            ),
+            // In window and NOT rolled back
+            sample_action(3, "call_active", "write_file", "available", None),
+        ];
+
+        let history = vec![
+            Entry::User {
+                text: "Edit server.properties".into(),
+            },
+            Entry::Assistant {
+                text: String::new(),
+                tool_calls: vec![
+                    tool_call("call_recent", "edit_file"),
+                    tool_call("call_active", "write_file"),
+                ],
+            },
+            Entry::ToolResult {
+                call_id: "call_recent".into(),
+                name: "edit_file".into(),
+                content: "Replaced 1 occurrence.".into(),
+                is_error: false,
+            },
+            Entry::ToolResult {
+                call_id: "call_active".into(),
+                name: "write_file".into(),
+                content: "Wrote 10 bytes.".into(),
+                is_error: false,
+            },
+        ];
+
+        let (system, annotated) = apply_rollback_context("Base prompt.", history.clone(), &actions);
+
+        // Turn ordering and count are preserved.
+        assert_eq!(annotated.len(), history.len());
+
+        // In-window rolled-back ToolResult gets the note appended.
+        match &annotated[2] {
+            Entry::ToolResult {
+                call_id, content, ..
+            } => {
+                assert_eq!(call_id, "call_recent");
+                assert!(content.starts_with("Replaced 1 occurrence."));
+                assert!(content.contains("[Note: the user later rolled back this action: Restored /server.properties"));
+            }
+            other => panic!("expected ToolResult, got {other:?}"),
+        }
+
+        // Active action's ToolResult is untouched.
+        assert_eq!(annotated[3], history[3]);
+
+        // Out-of-window rolled-back action appears in system prompt, while in-window one does not duplicate there.
+        assert!(system.starts_with("Base prompt."));
+        assert!(system.contains("Rename the server (rename_server)"));
+        assert!(system.contains("Restored server name to \"Survival\"."));
+        assert!(!system.contains("edit_file"));
+    }
+
+    #[test]
+    fn apply_rollback_context_is_noop_when_nothing_was_rolled_back() {
+        let actions = vec![sample_action(1, "c1", "write_file", "available", None)];
+        let history = vec![Entry::User { text: "hi".into() }];
+        let (system, out) = apply_rollback_context("Prompt", history.clone(), &actions);
+        assert_eq!(system, "Prompt");
+        assert_eq!(out, history);
+    }
 }

@@ -167,9 +167,10 @@ pub async fn append(
     Ok(Message { id, entry, created })
 }
 
-#[derive(Clone, Serialize)]
+#[derive(Clone, Debug, Serialize)]
 pub struct Action {
     pub uuid: Uuid,
+    pub seq: i64,
     pub call_id: String,
     pub tool: String,
     /// The tool's title, for the action card.
@@ -180,10 +181,16 @@ pub struct Action {
     pub result: Option<String>,
     pub created: DateTime<Utc>,
     pub decided: Option<DateTime<Utc>>,
+    /// `unavailable`, `available`, `rolling_back`, `rolled_back` or `failed`.
+    pub rollback_status: String,
+    pub rollback_summary: Option<String>,
+    pub rollback_result: Option<String>,
+    pub rolled_back: Option<DateTime<Utc>>,
 }
 
 type ActionRow = (
     Uuid,
+    i64,
     String,
     String,
     String,
@@ -191,16 +198,35 @@ type ActionRow = (
     Option<String>,
     DateTime<Utc>,
     Option<DateTime<Utc>>,
+    String,
+    Option<String>,
+    Option<String>,
+    Option<DateTime<Utc>>,
 );
 
-const ACTION_COLUMNS: &str = "uuid, call_id, tool, arguments, status, result, created, decided";
+const ACTION_COLUMNS: &str = "uuid, seq, call_id, tool, arguments, status, result, created, decided, rollback_status, rollback_summary, rollback_result, rolled_back";
 
 impl From<ActionRow> for Action {
     fn from(
-        (uuid, call_id, tool, arguments, status, result, created, decided): ActionRow,
+        (
+            uuid,
+            seq,
+            call_id,
+            tool,
+            arguments,
+            status,
+            result,
+            created,
+            decided,
+            rollback_status,
+            rollback_summary,
+            rollback_result,
+            rolled_back,
+        ): ActionRow,
     ) -> Self {
         Self {
             uuid,
+            seq,
             call_id,
             title: crate::tools::find(&tool)
                 .map(|tool| tool.title.to_string())
@@ -211,6 +237,10 @@ impl From<ActionRow> for Action {
             result,
             created,
             decided,
+            rollback_status,
+            rollback_summary,
+            rollback_result,
+            rolled_back,
         }
     }
 }
@@ -218,9 +248,42 @@ impl From<ActionRow> for Action {
 pub async fn actions(db: &Database, conversation: Uuid) -> Result<Vec<Action>, sqlx::Error> {
     let rows: Vec<ActionRow> = sqlx::query_as(sqlx::AssertSqlSafe(format!(
         "SELECT {ACTION_COLUMNS} FROM dev_caloptreyx_aiassistant_actions
-         WHERE conversation_uuid = $1 ORDER BY created"
+         WHERE conversation_uuid = $1 ORDER BY seq ASC"
     )))
     .bind(conversation)
+    .fetch_all(db.read())
+    .await?;
+    Ok(rows.into_iter().map(Action::from).collect())
+}
+
+pub async fn action(
+    db: &Database,
+    conversation: Uuid,
+    uuid: Uuid,
+) -> Result<Option<Action>, sqlx::Error> {
+    let row: Option<ActionRow> = sqlx::query_as(sqlx::AssertSqlSafe(format!(
+        "SELECT {ACTION_COLUMNS} FROM dev_caloptreyx_aiassistant_actions
+         WHERE uuid = $1 AND conversation_uuid = $2"
+    )))
+    .bind(uuid)
+    .bind(conversation)
+    .fetch_optional(db.read())
+    .await?;
+    Ok(row.map(Action::from))
+}
+
+pub async fn actions_from_seq_desc(
+    db: &Database,
+    conversation: Uuid,
+    min_seq: i64,
+) -> Result<Vec<Action>, sqlx::Error> {
+    let rows: Vec<ActionRow> = sqlx::query_as(sqlx::AssertSqlSafe(format!(
+        "SELECT {ACTION_COLUMNS} FROM dev_caloptreyx_aiassistant_actions
+         WHERE conversation_uuid = $1 AND seq >= $2
+         ORDER BY seq DESC"
+    )))
+    .bind(conversation)
+    .bind(min_seq)
     .fetch_all(db.read())
     .await?;
     Ok(rows.into_iter().map(Action::from).collect())
@@ -286,6 +349,134 @@ pub async fn finish_action(
     Ok(row.map(Action::from))
 }
 
+/// Atomically finishes a confirmed action and, when it succeeded with a captured snapshot, stores
+/// that snapshot and marks rollback as available.
+pub async fn finish_action_with_rollback(
+    db: &Database,
+    uuid: Uuid,
+    status: &str,
+    result: &str,
+    rollback_status: &str,
+    rollback_summary: Option<&str>,
+    snapshot: Option<(&str, &str)>,
+) -> Result<Option<Action>, sqlx::Error> {
+    let mut tx = db.write().begin().await?;
+    if status == "succeeded"
+        && let Some((kind, payload)) = snapshot
+    {
+        sqlx::query(
+            "INSERT INTO dev_caloptreyx_aiassistant_snapshots (action_uuid, kind, payload)
+             VALUES ($1, $2, $3)
+             ON CONFLICT (action_uuid) DO UPDATE SET
+                 kind = EXCLUDED.kind,
+                 payload = EXCLUDED.payload",
+        )
+        .bind(uuid)
+        .bind(kind)
+        .bind(payload)
+        .execute(&mut *tx)
+        .await?;
+    }
+    let row: Option<ActionRow> = sqlx::query_as(sqlx::AssertSqlSafe(format!(
+        "UPDATE dev_caloptreyx_aiassistant_actions
+         SET status = $2, result = $3, rollback_status = $4, rollback_summary = $5
+         WHERE uuid = $1
+         RETURNING {ACTION_COLUMNS}"
+    )))
+    .bind(uuid)
+    .bind(status)
+    .bind(result)
+    .bind(rollback_status)
+    .bind(rollback_summary)
+    .fetch_optional(&mut *tx)
+    .await?;
+    tx.commit().await?;
+    Ok(row.map(Action::from))
+}
+
+pub async fn load_snapshot(
+    db: &Database,
+    action_uuid: Uuid,
+) -> Result<Option<(String, String)>, sqlx::Error> {
+    sqlx::query_as(
+        "SELECT kind, payload FROM dev_caloptreyx_aiassistant_snapshots
+         WHERE action_uuid = $1",
+    )
+    .bind(action_uuid)
+    .fetch_optional(db.read())
+    .await
+}
+
+/// Atomically transitions a reversible action from `available` or `failed` to `rolling_back`.
+pub async fn begin_rollback(
+    db: &Database,
+    conversation: Uuid,
+    uuid: Uuid,
+) -> Result<Option<Action>, sqlx::Error> {
+    let row: Option<ActionRow> = sqlx::query_as(sqlx::AssertSqlSafe(format!(
+        "UPDATE dev_caloptreyx_aiassistant_actions
+         SET rollback_status = 'rolling_back', rolled_back = now()
+         WHERE uuid = $1 AND conversation_uuid = $2
+             AND status = 'succeeded'
+             AND rollback_status IN ('available', 'failed')
+         RETURNING {ACTION_COLUMNS}"
+    )))
+    .bind(uuid)
+    .bind(conversation)
+    .fetch_optional(db.write())
+    .await?;
+    Ok(row.map(Action::from))
+}
+
+/// Reverts `rolling_back` back to `available` when a non-forced conflict stops the rollback.
+pub async fn revert_rollback(db: &Database, uuid: Uuid) -> Result<Option<Action>, sqlx::Error> {
+    let row: Option<ActionRow> = sqlx::query_as(sqlx::AssertSqlSafe(format!(
+        "UPDATE dev_caloptreyx_aiassistant_actions
+         SET rollback_status = 'available', rolled_back = NULL
+         WHERE uuid = $1
+         RETURNING {ACTION_COLUMNS}"
+    )))
+    .bind(uuid)
+    .fetch_optional(db.write())
+    .await?;
+    Ok(row.map(Action::from))
+}
+
+/// Records the outcome of a rollback attempt (`rolled_back` or `failed`).
+pub async fn finish_rollback(
+    db: &Database,
+    uuid: Uuid,
+    rollback_status: &str,
+    rollback_result: &str,
+) -> Result<Option<Action>, sqlx::Error> {
+    let row: Option<ActionRow> = if rollback_status == "rolled_back" {
+        sqlx::query_as(sqlx::AssertSqlSafe(format!(
+            "UPDATE dev_caloptreyx_aiassistant_actions
+             SET rollback_status = $2, rollback_result = $3, rolled_back = now()
+             WHERE uuid = $1
+             RETURNING {ACTION_COLUMNS}"
+        )))
+        .bind(uuid)
+        .bind(rollback_status)
+        .bind(rollback_result)
+        .fetch_optional(db.write())
+        .await?
+    } else {
+        sqlx::query_as(sqlx::AssertSqlSafe(format!(
+            "UPDATE dev_caloptreyx_aiassistant_actions
+             SET rollback_status = $2, rollback_result = $3, rolled_back = NULL
+             WHERE uuid = $1
+             RETURNING {ACTION_COLUMNS}"
+        )))
+        .bind(uuid)
+        .bind(rollback_status)
+        .bind(rollback_result)
+        .fetch_optional(db.write())
+        .await?
+    };
+    Ok(row.map(Action::from))
+}
+
 /// Actions still running a long time after they were confirmed were cut off by a restart.
 pub async fn fail_interrupted_actions(db: &Database, conversation: Uuid) -> Result<(), sqlx::Error> {
     sqlx::query(
@@ -293,6 +484,25 @@ pub async fn fail_interrupted_actions(db: &Database, conversation: Uuid) -> Resu
          SET status = 'failed', result = 'Interrupted: the panel restarted while this action ran.'
          WHERE conversation_uuid = $1 AND status = 'running'
              AND decided < now() - interval '15 minutes'",
+    )
+    .bind(conversation)
+    .execute(db.write())
+    .await?;
+    Ok(())
+}
+
+/// Rollbacks still running a long time after they started were cut off by a restart.
+pub async fn fail_interrupted_rollbacks(
+    db: &Database,
+    conversation: Uuid,
+) -> Result<(), sqlx::Error> {
+    sqlx::query(
+        "UPDATE dev_caloptreyx_aiassistant_actions
+         SET rollback_status = 'failed',
+             rollback_result = 'Interrupted: the panel restarted while this rollback ran.',
+             rolled_back = NULL
+         WHERE conversation_uuid = $1 AND rollback_status = 'rolling_back'
+             AND COALESCE(rolled_back, decided, created) < now() - interval '15 minutes'",
     )
     .bind(conversation)
     .execute(db.write())

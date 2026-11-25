@@ -2,7 +2,10 @@
 //! `/api/admin/extensions/dev.caloptreyx.aiassistant`. The chat needs the `ai-assistant.chat`
 //! admin permission; the settings need `extensions.read` / `extensions.manage`.
 
-use super::{Caller, CreatePayload, Decision, RejectPayload, RenamePayload, Room, SendPayload};
+use super::{
+    Caller, CreatePayload, Decision, RejectPayload, RenamePayload, RollbackPayload, Room,
+    SendPayload,
+};
 use crate::settings::{self, Settings, Update};
 use axum::{
     extract::Path,
@@ -108,6 +111,26 @@ async fn reject(
     .await
 }
 
+async fn rollback(
+    state: GetState,
+    caller: Caller,
+    Path((conversation, action)): Path<(Uuid, Uuid)>,
+    Payload(data): Payload<RollbackPayload>,
+) -> ApiResponseResult {
+    let room = room(&caller)?;
+    super::rollback(&state, &caller, &room, conversation, action, data).await
+}
+
+async fn rollback_to(
+    state: GetState,
+    caller: Caller,
+    Path((conversation, action)): Path<(Uuid, Uuid)>,
+    Payload(data): Payload<RollbackPayload>,
+) -> ApiResponseResult {
+    let room = room(&caller)?;
+    super::rollback_to(&state, &caller, &room, conversation, action, data).await
+}
+
 async fn get_settings(state: GetState, caller: Caller) -> ApiResponseResult {
     caller.permissions.has_admin_permission("extensions.read")?;
     let settings = settings::load(&state).await?;
@@ -189,6 +212,14 @@ pub fn router(state: &State) -> OpenApiRouter<State> {
         .route(
             "/conversations/{conversation}/actions/{action}/reject",
             post(reject),
+        )
+        .route(
+            "/conversations/{conversation}/actions/{action}/rollback",
+            post(rollback),
+        )
+        .route(
+            "/conversations/{conversation}/actions/{action}/rollback-to",
+            post(rollback_to),
         )
         .route("/settings", get(get_settings).put(put_settings))
         .route("/settings/test", post(test_settings))

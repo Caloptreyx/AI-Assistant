@@ -2,6 +2,7 @@ use super::{
     Ctx,
     args::{any_text, boolean, integer, optional_integer, optional_text, server, text, to_map},
     output::{MAX_TEXT, floor_boundary, render, request, sha256_hex},
+    rollback::{self, MAX_FILE_BYTES, RollbackCapture, Snapshot},
 };
 use crate::proxy;
 use axum::http::Method;
@@ -12,7 +13,7 @@ fn contents_path(server: &str) -> String {
 }
 
 /// Reads a whole text file through the panel. `Ok(None)` when it does not exist.
-async fn fetch(ctx: &Ctx, server: &str, file: &str) -> Result<Option<String>, String> {
+pub(super) async fn fetch(ctx: &Ctx, server: &str, file: &str) -> Result<Option<String>, String> {
     let query = to_map(json!({ "file": file }));
     let reply = proxy::call(ctx, Method::GET, &contents_path(server), Some(&query), None).await?;
 
@@ -35,7 +36,19 @@ async fn fetch(ctx: &Ctx, server: &str, file: &str) -> Result<Option<String>, St
         .map_err(|_| format!("{file} is not a UTF-8 text file"))
 }
 
-async fn put(ctx: &Ctx, server: &str, file: &str, content: &str) -> Result<(), String> {
+/// Checks whether a file currently exists on the server, even if it is binary or oversized.
+pub(super) async fn file_exists(ctx: &Ctx, server: &str, file: &str) -> Result<bool, String> {
+    let query = to_map(json!({ "file": file }));
+    let reply = proxy::call(ctx, Method::GET, &contents_path(server), Some(&query), None).await?;
+    match reply.status {
+        404 => Ok(false),
+        413 => Ok(true),
+        status if status >= 400 => Err(render(&reply).err().unwrap_or_default()),
+        _ => Ok(true),
+    }
+}
+
+pub(super) async fn put(ctx: &Ctx, server: &str, file: &str, content: &str) -> Result<(), String> {
     let query = to_map(json!({ "file": file }));
     request(
         ctx,
@@ -84,7 +97,10 @@ pub async fn list(ctx: &Ctx, args: &Map<String, Value>) -> Result<String, String
     .await
 }
 
-pub async fn delete(ctx: &Ctx, args: &Map<String, Value>) -> Result<String, String> {
+pub async fn delete(
+    ctx: &Ctx,
+    args: &Map<String, Value>,
+) -> Result<(String, RollbackCapture), String> {
     let server = server(args)?;
     let root = optional_text(args, "root")?
         .filter(|root| !root.is_empty())
@@ -101,6 +117,8 @@ pub async fn delete(ctx: &Ctx, args: &Map<String, Value>) -> Result<String, Stri
         _ => return Err("`files` must list 1 to 100 file or directory names".into()),
     };
 
+    let capture = rollback::capture_delete_files(ctx, server, root, &files).await;
+
     request(
         ctx,
         Method::POST,
@@ -109,9 +127,12 @@ pub async fn delete(ctx: &Ctx, args: &Map<String, Value>) -> Result<String, Stri
         Some(&json!({ "root": root, "files": files })),
     )
     .await?;
-    Ok(format!(
-        "Deleted {} from {root} on server {server}.",
-        files.join(", ")
+    Ok((
+        format!(
+            "Deleted {} from {root} on server {server}.",
+            files.join(", ")
+        ),
+        capture,
     ))
 }
 
@@ -260,13 +281,22 @@ pub async fn read(ctx: &Ctx, args: &Map<String, Value>) -> Result<String, String
     Ok(format!("{}\n\n{}", view.text, view.note))
 }
 
-pub async fn write(ctx: &Ctx, args: &Map<String, Value>) -> Result<String, String> {
+enum PreWrite {
+    Existed(String),
+    Created,
+    Unavailable(String),
+}
+
+pub async fn write(
+    ctx: &Ctx,
+    args: &Map<String, Value>,
+) -> Result<(String, RollbackCapture), String> {
     let server = server(args)?;
     let file = text(args, "file")?;
     let content = any_text(args, "content")?;
     let expected = optional_text(args, "expected_sha256")?;
 
-    match fetch(ctx, server, file).await {
+    let pre = match fetch(ctx, server, file).await {
         Ok(Some(current)) => {
             check_expected(file, &current, expected)?;
             if expected.is_none() && current.len() > MAX_TEXT {
@@ -276,27 +306,70 @@ Use edit_file to change part of it. If you really mean to replace all of it, pas
                     current.len()
                 ));
             }
+            if current.len() <= MAX_FILE_BYTES {
+                PreWrite::Existed(current)
+            } else {
+                PreWrite::Unavailable(format!(
+                    "Previous contents of {file} exceeded the 1 MB snapshot limit ({} bytes).",
+                    current.len()
+                ))
+            }
         }
         Ok(None) if expected.is_some() => {
             return Err(format!(
                 "{file} does not exist, but expected_sha256 was given. Leave expected_sha256 out to create it."
             ));
         }
-        Ok(None) => {}
+        Ok(None) => PreWrite::Created,
         // A file that cannot be read cannot have been read in part either.
         Err(err) if expected.is_some() => return Err(err),
-        Err(_) => {}
-    }
+        Err(err) => PreWrite::Unavailable(format!(
+            "Could not snapshot previous contents of {file}: {err}"
+        )),
+    };
 
     put(ctx, server, file, content).await?;
-    Ok(format!(
-        "Wrote {} bytes to {file} on server {server}. Its sha256 is now {}.",
-        content.len(),
-        sha256_hex(content.as_bytes())
+    let post_sha256 = sha256_hex(content.as_bytes());
+    let capture = match pre {
+        PreWrite::Existed(previous_content) => RollbackCapture::Available {
+            summary: format!(
+                "Restore previous contents of {file} ({} bytes)",
+                previous_content.len()
+            ),
+            snapshot: Snapshot::WriteFile {
+                server: server.to_string(),
+                file: file.to_string(),
+                existed: true,
+                previous_content: Some(previous_content),
+                post_sha256: post_sha256.clone(),
+            },
+        },
+        PreWrite::Created => RollbackCapture::Available {
+            summary: format!("Delete newly created file {file}"),
+            snapshot: Snapshot::WriteFile {
+                server: server.to_string(),
+                file: file.to_string(),
+                existed: false,
+                previous_content: None,
+                post_sha256: post_sha256.clone(),
+            },
+        },
+        PreWrite::Unavailable(reason) => RollbackCapture::unavailable(reason),
+    };
+
+    Ok((
+        format!(
+            "Wrote {} bytes to {file} on server {server}. Its sha256 is now {post_sha256}.",
+            content.len(),
+        ),
+        capture,
     ))
 }
 
-pub async fn edit(ctx: &Ctx, args: &Map<String, Value>) -> Result<String, String> {
+pub async fn edit(
+    ctx: &Ctx,
+    args: &Map<String, Value>,
+) -> Result<(String, RollbackCapture), String> {
     let server = server(args)?;
     let file = text(args, "file")?;
     let old = text(args, "old_string")?;
@@ -344,11 +417,31 @@ pub async fn edit(ctx: &Ctx, args: &Map<String, Value>) -> Result<String, String
     };
     put(ctx, server, file, &updated).await?;
 
-    Ok(format!(
-        "Replaced {count} occurrence{} in {file} on server {server}. It is now {} bytes, sha256 {}.",
-        if count == 1 { "" } else { "s" },
-        updated.len(),
-        sha256_hex(updated.as_bytes())
+    let post_sha256 = sha256_hex(updated.as_bytes());
+    let capture = if content.len() <= MAX_FILE_BYTES {
+        RollbackCapture::Available {
+            summary: format!("Restore previous contents of {file} ({} bytes)", content.len()),
+            snapshot: Snapshot::EditFile {
+                server: server.to_string(),
+                file: file.to_string(),
+                previous_content: content,
+                post_sha256: post_sha256.clone(),
+            },
+        }
+    } else {
+        RollbackCapture::unavailable(format!(
+            "Previous contents of {file} exceeded the 1 MB snapshot limit ({} bytes).",
+            content.len()
+        ))
+    };
+
+    Ok((
+        format!(
+            "Replaced {count} occurrence{} in {file} on server {server}. It is now {} bytes, sha256 {post_sha256}.",
+            if count == 1 { "" } else { "s" },
+            updated.len(),
+        ),
+        capture,
     ))
 }
 

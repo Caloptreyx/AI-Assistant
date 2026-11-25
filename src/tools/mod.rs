@@ -17,11 +17,13 @@ mod definitions;
 mod files;
 mod manage;
 pub mod output;
+pub mod rollback;
 mod servers;
 #[cfg(test)]
 mod tests;
 
 use crate::{access::Access, provider::ToolSpec, upstream::Upstream};
+use rollback::RollbackCapture;
 use serde_json::{Map, Value, json};
 use shared::models::user::PermissionManager;
 use std::sync::Arc;
@@ -201,7 +203,7 @@ fn prepare(
     Ok((tool, args))
 }
 
-fn ctx(upstream: Arc<dyn Upstream>, scope: &Scope, confirmed: bool) -> Ctx {
+pub(super) fn ctx(upstream: Arc<dyn Upstream>, scope: &Scope, confirmed: bool) -> Ctx {
     Ctx {
         upstream,
         access: Access {
@@ -232,56 +234,74 @@ pub async fn run_unconfirmed(
     };
     match tool.effect {
         Effect::Change => Unconfirmed::NeedsConfirmation(tool),
-        Effect::Read => Unconfirmed::Ran(execute(&ctx(upstream, scope, false), tool, &args).await),
+        Effect::Read => Unconfirmed::Ran(
+            execute(&ctx(upstream, scope, false), tool, &args)
+                .await
+                .map(|(text, _)| text),
+        ),
     }
 }
 
 /// Runs a call the user confirmed. Only the confirm endpoint calls this, after it atomically
 /// moved the stored action from pending to running. Permissions are checked again because they
 /// may have changed since the model proposed the call.
+///
+/// Returns `(outcome, rollback_capture)`. Whenever `outcome` is `Err`, `rollback_capture` is
+/// always [`RollbackCapture::Unavailable`] with no snapshot.
 pub async fn run_confirmed(
     upstream: Arc<dyn Upstream>,
     scope: &Scope,
     permissions: &dyn Permissions,
     name: &str,
     arguments: &Value,
-) -> Result<String, String> {
-    let (tool, args) = prepare(scope, permissions, name, arguments)?;
-    execute(&ctx(upstream, scope, true), tool, &args).await
+) -> (Result<String, String>, RollbackCapture) {
+    let (tool, args) = match prepare(scope, permissions, name, arguments) {
+        Ok(prepared) => prepared,
+        Err(err) => return (Err(err), RollbackCapture::none()),
+    };
+    match execute(&ctx(upstream, scope, true), tool, &args).await {
+        Ok((text, capture)) => (Ok(text), capture),
+        Err(err) => (Err(err), RollbackCapture::none()),
+    }
 }
 
-async fn execute(ctx: &Ctx, tool: &Tool, args: &Map<String, Value>) -> Result<String, String> {
+async fn execute(
+    ctx: &Ctx,
+    tool: &Tool,
+    args: &Map<String, Value>,
+) -> Result<(String, RollbackCapture), String> {
+    let plain = |result: Result<String, String>| result.map(|text| (text, RollbackCapture::none()));
     match tool.name {
-        "get_server" => servers::get(ctx, args).await,
-        "list_servers" => servers::list(ctx, args).await,
-        "read_console" => servers::console(ctx, args).await,
-        "power_server" => servers::power(ctx, args).await,
-        "send_command" => servers::command(ctx, args).await,
-        "run_command" => servers::run_command(ctx, args).await,
+        "get_server" => plain(servers::get(ctx, args).await),
+        "list_servers" => plain(servers::list(ctx, args).await),
+        "read_console" => plain(servers::console(ctx, args).await),
+        "power_server" => plain(servers::power(ctx, args).await),
+        "send_command" => plain(servers::command(ctx, args).await),
+        "run_command" => plain(servers::run_command(ctx, args).await),
         "rename_server" => servers::rename(ctx, args).await,
-        "list_files" => files::list(ctx, args).await,
-        "read_file" => files::read(ctx, args).await,
+        "list_files" => plain(files::list(ctx, args).await),
+        "read_file" => plain(files::read(ctx, args).await),
         "write_file" => files::write(ctx, args).await,
         "edit_file" => files::edit(ctx, args).await,
         "delete_files" => files::delete(ctx, args).await,
-        "list_backups" => manage::list_backups(ctx, args).await,
-        "create_backup" => manage::create_backup(ctx, args).await,
-        "restore_backup" => manage::restore_backup(ctx, args).await,
-        "delete_backup" => manage::delete_backup(ctx, args).await,
-        "list_schedules" => manage::list_schedules(ctx, args).await,
+        "list_backups" => plain(manage::list_backups(ctx, args).await),
+        "create_backup" => plain(manage::create_backup(ctx, args).await),
+        "restore_backup" => plain(manage::restore_backup(ctx, args).await),
+        "delete_backup" => plain(manage::delete_backup(ctx, args).await),
+        "list_schedules" => plain(manage::list_schedules(ctx, args).await),
         "create_schedule" => manage::create_schedule(ctx, args).await,
-        "run_schedule" => manage::run_schedule(ctx, args).await,
-        "list_startup_variables" => manage::list_variables(ctx, args).await,
+        "run_schedule" => plain(manage::run_schedule(ctx, args).await),
+        "list_startup_variables" => plain(manage::list_variables(ctx, args).await),
         "update_startup_variables" => manage::update_variables(ctx, args).await,
-        "panel_stats" => admin::stats(ctx).await,
-        "list_nodes" => admin::list_nodes(ctx, args).await,
-        "get_node_overview" => admin::node_overview(ctx, args).await,
-        "list_users" => admin::list_users(ctx, args).await,
-        "list_all_servers" => admin::list_all_servers(ctx, args).await,
-        "search_api" => api::search(ctx, args).await,
-        "describe_api" => api::describe(ctx, args).await,
-        "read_api" => api::read(ctx, args).await,
-        "write_api" => api::write(ctx, args).await,
+        "panel_stats" => plain(admin::stats(ctx).await),
+        "list_nodes" => plain(admin::list_nodes(ctx, args).await),
+        "get_node_overview" => plain(admin::node_overview(ctx, args).await),
+        "list_users" => plain(admin::list_users(ctx, args).await),
+        "list_all_servers" => plain(admin::list_all_servers(ctx, args).await),
+        "search_api" => plain(api::search(ctx, args).await),
+        "describe_api" => plain(api::describe(ctx, args).await),
+        "read_api" => plain(api::read(ctx, args).await),
+        "write_api" => plain(api::write(ctx, args).await),
         other => Err(format!("Unknown tool: {other}")),
     }
 }

@@ -17,7 +17,11 @@ use crate::{
     provider::Provider,
     settings::{self, Settings},
     ssrf,
-    tools::{self, Effect, Scope, output::clip},
+    tools::{
+        self, Effect, Scope,
+        output::clip,
+        rollback::{RollbackCapture, RollbackError, Snapshot},
+    },
     upstream::{LiveUpstream, Upstream},
 };
 use axum::{
@@ -385,6 +389,7 @@ pub async fn create(
 pub async fn get(state: &State, caller: &Caller, room: &Room, uuid: Uuid) -> ApiResponseResult {
     let conversation = find_conversation(state, caller, room, uuid).await?;
     db::fail_interrupted_actions(&state.database, uuid).await?;
+    db::fail_interrupted_rollbacks(&state.database, uuid).await?;
     ApiResponse::new_serialized(json!({
         "conversation": conversation,
         "messages": db::messages(&state.database, uuid).await?,
@@ -560,7 +565,7 @@ async fn reject_pending(
         if let Some(action) =
             db::finish_action(&state.database, action.uuid, "rejected", reason).await?
         {
-            events.push(Event::Action(action));
+            events.push(Event::Action(Box::new(action)));
         }
         events.push(Event::Message(message));
     }
@@ -679,24 +684,60 @@ pub async fn decide(
                 .await?
                 .ok_or_else(not_pending)?;
             let limit = settings.tool_output_limit.max(1000) as usize;
-            let outcome = tools::run_confirmed(
+            let (raw_outcome, capture) = tools::run_confirmed(
                 caller.upstream(state),
                 &room.scope(),
                 &caller.permissions,
                 &action.tool,
                 &action.arguments,
             )
-            .await
-            .map(|text| clip(&text, limit))
-            .map_err(|text| clip(&text, limit));
+            .await;
+            let outcome = raw_outcome
+                .map(|text| clip(&text, limit))
+                .map_err(|text| clip(&text, limit));
             let (status, text) = match &outcome {
                 Ok(text) => ("succeeded", text.clone()),
                 Err(text) => ("failed", text.clone()),
             };
+            let (rollback_status, rollback_summary, snapshot_pair) = if status == "succeeded" {
+                match capture {
+                    RollbackCapture::Available { summary, snapshot } => {
+                        match serde_json::to_string(&snapshot) {
+                            Ok(payload) => {
+                                ("available", Some(summary), Some((snapshot.kind(), payload)))
+                            }
+                            Err(err) => {
+                                tracing::warn!(
+                                    "ai assistant: could not serialize snapshot for {}: {err}",
+                                    action.uuid
+                                );
+                                (
+                                    "unavailable",
+                                    Some("Could not store rollback snapshot.".into()),
+                                    None,
+                                )
+                            }
+                        }
+                    }
+                    RollbackCapture::Unavailable { summary } => ("unavailable", summary, None),
+                }
+            } else {
+                ("unavailable", None, None)
+            };
             let message = store_result(state, uuid, &action, outcome).await?;
-            let action = db::finish_action(&state.database, action.uuid, status, &text)
-                .await?
-                .unwrap_or(action);
+            let action = db::finish_action_with_rollback(
+                &state.database,
+                action.uuid,
+                status,
+                &text,
+                rollback_status,
+                rollback_summary.as_deref(),
+                snapshot_pair
+                    .as_ref()
+                    .map(|(kind, payload)| (*kind, payload.as_str())),
+            )
+            .await?
+            .unwrap_or(action);
             (action, message)
         }
         Decision::Reject(reject) => {
@@ -729,6 +770,224 @@ pub async fn decide(
         "action": action,
         "message": message,
         "pending": pending,
+    }))
+    .ok()
+}
+
+#[derive(Deserialize, Default)]
+pub struct RollbackPayload {
+    #[serde(default)]
+    pub force: bool,
+}
+
+async fn load_parsed_snapshot(
+    state: &State,
+    action_uuid: Uuid,
+) -> Result<Result<Snapshot, String>, sqlx::Error> {
+    let Some((_kind, payload)) = db::load_snapshot(&state.database, action_uuid).await? else {
+        return Ok(Err("Rollback snapshot was not found for this action.".into()));
+    };
+    match serde_json::from_str::<Snapshot>(&payload) {
+        Ok(snapshot) => Ok(Ok(snapshot)),
+        Err(err) => {
+            tracing::warn!("ai assistant: unreadable snapshot for {action_uuid}: {err}");
+            Ok(Err("Rollback snapshot is corrupted and cannot be applied.".into()))
+        }
+    }
+}
+
+/// Rolls back a single succeeded action using its stored pre-change snapshot.
+pub async fn rollback(
+    state: &State,
+    caller: &Caller,
+    room: &Room,
+    uuid: Uuid,
+    action: Uuid,
+    data: RollbackPayload,
+) -> ApiResponseResult {
+    enabled_settings(state, room).await?;
+    find_conversation(state, caller, room, uuid).await?;
+    let _guard = busy(uuid)?;
+
+    let existing = db::action(&state.database, uuid, action)
+        .await?
+        .ok_or_else(|| error(StatusCode::NOT_FOUND, "action not found"))?;
+    let Some(action_row) = db::begin_rollback(&state.database, uuid, action).await? else {
+        let message = match existing.rollback_status.as_str() {
+            "rolled_back" => "This action has already been rolled back.",
+            "rolling_back" => "This action is already being rolled back.",
+            _ => "This action cannot be rolled back.",
+        };
+        return Err(error(StatusCode::CONFLICT, message));
+    };
+
+    let snapshot = match load_parsed_snapshot(state, action_row.uuid).await? {
+        Ok(snapshot) => snapshot,
+        Err(err) => {
+            let updated = db::finish_rollback(&state.database, action_row.uuid, "failed", &err)
+                .await?
+                .unwrap_or(action_row);
+            db::touch_conversation(&state.database, uuid, None).await?;
+            return ApiResponse::new_serialized(json!({ "action": updated })).ok();
+        }
+    };
+
+    match tools::rollback::execute(
+        caller.upstream(state),
+        &room.scope(),
+        &caller.permissions,
+        &snapshot,
+        data.force,
+    )
+    .await
+    {
+        Ok(result) => {
+            let updated =
+                db::finish_rollback(&state.database, action_row.uuid, "rolled_back", &result)
+                    .await?
+                    .unwrap_or(action_row);
+            db::touch_conversation(&state.database, uuid, None).await?;
+            ApiResponse::new_serialized(json!({ "action": updated })).ok()
+        }
+        Err(RollbackError::Conflict(message)) => {
+            db::revert_rollback(&state.database, action_row.uuid).await?;
+            ApiResponse::new_serialized(json!({
+                "conflict": true,
+                "message": message,
+                "action_uuid": action_row.uuid,
+            }))
+            .with_status(StatusCode::CONFLICT)
+            .ok()
+        }
+        Err(RollbackError::Failed(message)) => {
+            let updated =
+                db::finish_rollback(&state.database, action_row.uuid, "failed", &message)
+                    .await?
+                    .unwrap_or(action_row);
+            db::touch_conversation(&state.database, uuid, None).await?;
+            ApiResponse::new_serialized(json!({ "action": updated })).ok()
+        }
+    }
+}
+
+/// Rolls back every reversible succeeded action at or after `action` in reverse order (`seq DESC`).
+pub async fn rollback_to(
+    state: &State,
+    caller: &Caller,
+    room: &Room,
+    uuid: Uuid,
+    action: Uuid,
+    data: RollbackPayload,
+) -> ApiResponseResult {
+    enabled_settings(state, room).await?;
+    find_conversation(state, caller, room, uuid).await?;
+    let _guard = busy(uuid)?;
+
+    let target = db::action(&state.database, uuid, action)
+        .await?
+        .ok_or_else(|| error(StatusCode::NOT_FOUND, "action not found"))?;
+    let candidates = db::actions_from_seq_desc(&state.database, uuid, target.seq).await?;
+
+    if candidates
+        .iter()
+        .any(|candidate| candidate.status == "running" || candidate.rollback_status == "rolling_back")
+    {
+        return Err(error(
+            StatusCode::CONFLICT,
+            "An action in this range is still running or rolling back.",
+        ));
+    }
+
+    let mut updated_actions: Vec<db::Action> = Vec::new();
+    let mut skipped: Vec<serde_json::Value> = Vec::new();
+
+    for candidate in candidates {
+        if candidate.status != "succeeded" || candidate.rollback_status == "rolled_back" {
+            continue;
+        }
+        if candidate.rollback_status == "unavailable" {
+            skipped.push(json!({
+                "uuid": candidate.uuid,
+                "title": candidate.title,
+                "reason": candidate
+                    .rollback_summary
+                    .unwrap_or_else(|| "Cannot be automatically rolled back.".into()),
+            }));
+            continue;
+        }
+        if candidate.rollback_status != "available" && candidate.rollback_status != "failed" {
+            continue;
+        }
+
+        let Some(action_row) = db::begin_rollback(&state.database, uuid, candidate.uuid).await?
+        else {
+            return Err(error(
+                StatusCode::CONFLICT,
+                "An action in this range changed state while rolling back.",
+            ));
+        };
+
+        let snapshot = match load_parsed_snapshot(state, action_row.uuid).await? {
+            Ok(snapshot) => snapshot,
+            Err(err) => {
+                let updated =
+                    db::finish_rollback(&state.database, action_row.uuid, "failed", &err)
+                        .await?
+                        .unwrap_or(action_row);
+                updated_actions.push(updated);
+                break;
+            }
+        };
+
+        match tools::rollback::execute(
+            caller.upstream(state),
+            &room.scope(),
+            &caller.permissions,
+            &snapshot,
+            data.force,
+        )
+        .await
+        {
+            Ok(result) => {
+                let updated =
+                    db::finish_rollback(&state.database, action_row.uuid, "rolled_back", &result)
+                        .await?
+                        .unwrap_or(action_row);
+                updated_actions.push(updated);
+            }
+            Err(RollbackError::Conflict(message)) => {
+                db::revert_rollback(&state.database, action_row.uuid).await?;
+                if !updated_actions.is_empty() {
+                    db::touch_conversation(&state.database, uuid, None).await?;
+                }
+                return ApiResponse::new_serialized(json!({
+                    "conflict": true,
+                    "message": message,
+                    "action_uuid": action_row.uuid,
+                    "actions": updated_actions,
+                    "skipped": skipped,
+                }))
+                .with_status(StatusCode::CONFLICT)
+                .ok();
+            }
+            Err(RollbackError::Failed(message)) => {
+                let updated =
+                    db::finish_rollback(&state.database, action_row.uuid, "failed", &message)
+                        .await?
+                        .unwrap_or(action_row);
+                updated_actions.push(updated);
+                break;
+            }
+        }
+    }
+
+    if !updated_actions.is_empty() {
+        db::touch_conversation(&state.database, uuid, None).await?;
+    }
+
+    ApiResponse::new_serialized(json!({
+        "actions": updated_actions,
+        "skipped": skipped,
     }))
     .ok()
 }

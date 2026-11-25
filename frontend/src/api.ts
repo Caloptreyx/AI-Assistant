@@ -1,5 +1,5 @@
 import { z } from 'zod';
-import { axiosInstance, getImpersonatedUser } from '@/api/axios.ts';
+import { axiosInstance, getHttpStatus, getImpersonatedUser } from '@/api/axios.ts';
 import { parseFromApi, serializeForApi } from '@/lib/serialization/api-transform.ts';
 import type { Action, Message } from './lib/chat.ts';
 import { CHAT_DISPLAYS } from './lib/display.ts';
@@ -61,6 +61,27 @@ export interface Decision {
   pending: number;
 }
 
+export interface SkippedRollback {
+  uuid: string;
+  title: string;
+  reason: string;
+}
+
+export type RollbackActionResult =
+  | { ok: true; action: Action }
+  | { ok: false; conflict: true; message: string; action_uuid: string };
+
+export type RollbackToResult =
+  | { ok: true; actions: Action[]; skipped: SkippedRollback[] }
+  | {
+      ok: false;
+      conflict: true;
+      message: string;
+      action_uuid: string;
+      actions: Action[];
+      skipped: SkippedRollback[];
+    };
+
 export const getInfo = async (base: string): Promise<ChatInfo> => (await axiosInstance.get(base)).data;
 
 export const getConversations = async (base: string): Promise<Conversation[]> =>
@@ -95,6 +116,69 @@ export const decideAction = async (
       {},
     )
   ).data;
+
+function conflictData(error: unknown): Record<string, unknown> | null {
+  if (getHttpStatus(error) !== 409) {
+    return null;
+  }
+  const data = (error as { response?: { data?: unknown } })?.response?.data;
+  if (data && typeof data === 'object' && (data as Record<string, unknown>).conflict === true) {
+    return data as Record<string, unknown>;
+  }
+  return null;
+}
+
+export const rollbackAction = async (
+  base: string,
+  conversation: string,
+  action: string,
+  force = false,
+): Promise<RollbackActionResult> => {
+  try {
+    const data = (
+      await axiosInstance.post(`${base}/conversations/${conversation}/actions/${action}/rollback`, { force })
+    ).data as { action: Action };
+    return { ok: true, action: data.action };
+  } catch (error) {
+    const conflict = conflictData(error);
+    if (conflict) {
+      return {
+        ok: false,
+        conflict: true,
+        message: String(conflict.message ?? 'This resource changed after the action ran.'),
+        action_uuid: String(conflict.action_uuid ?? action),
+      };
+    }
+    throw error;
+  }
+};
+
+export const rollbackToAction = async (
+  base: string,
+  conversation: string,
+  action: string,
+  force = false,
+): Promise<RollbackToResult> => {
+  try {
+    const data = (
+      await axiosInstance.post(`${base}/conversations/${conversation}/actions/${action}/rollback-to`, { force })
+    ).data as { actions: Action[]; skipped: SkippedRollback[] };
+    return { ok: true, actions: data.actions ?? [], skipped: data.skipped ?? [] };
+  } catch (error) {
+    const conflict = conflictData(error);
+    if (conflict) {
+      return {
+        ok: false,
+        conflict: true,
+        message: String(conflict.message ?? 'A resource changed after the action ran.'),
+        action_uuid: String(conflict.action_uuid ?? action),
+        actions: Array.isArray(conflict.actions) ? (conflict.actions as Action[]) : [],
+        skipped: Array.isArray(conflict.skipped) ? (conflict.skipped as SkippedRollback[]) : [],
+      };
+    }
+    throw error;
+  }
+};
 
 /**
  * Starts a turn (`messages` with `{ text }`, or `continue`) and feeds its server-sent events to

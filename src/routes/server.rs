@@ -2,7 +2,10 @@
 //! server and the user's permissions on it before these handlers run; using the chat needs the
 //! `ai-assistant.chat` server permission.
 
-use super::{Caller, CreatePayload, Decision, RejectPayload, RenamePayload, Room, SendPayload};
+use super::{
+    Caller, CreatePayload, Decision, RejectPayload, RenamePayload, RollbackPayload, Room,
+    SendPayload,
+};
 use axum::{
     extract::Path,
     http::StatusCode,
@@ -118,6 +121,26 @@ async fn reject(
     .await
 }
 
+async fn rollback(
+    state: GetState,
+    caller: Caller,
+    Path((_server, conversation, action)): Path<(String, Uuid, Uuid)>,
+    Payload(data): Payload<RollbackPayload>,
+) -> ApiResponseResult {
+    let room = room(&caller)?;
+    super::rollback(&state, &caller, &room, conversation, action, data).await
+}
+
+async fn rollback_to(
+    state: GetState,
+    caller: Caller,
+    Path((_server, conversation, action)): Path<(String, Uuid, Uuid)>,
+    Payload(data): Payload<RollbackPayload>,
+) -> ApiResponseResult {
+    let room = room(&caller)?;
+    super::rollback_to(&state, &caller, &room, conversation, action, data).await
+}
+
 pub fn router(state: &State) -> OpenApiRouter<State> {
     OpenApiRouter::new()
         .route("/", get(info))
@@ -136,6 +159,14 @@ pub fn router(state: &State) -> OpenApiRouter<State> {
         .route(
             "/conversations/{conversation}/actions/{action}/reject",
             post(reject),
+        )
+        .route(
+            "/conversations/{conversation}/actions/{action}/rollback",
+            post(rollback),
+        )
+        .route(
+            "/conversations/{conversation}/actions/{action}/rollback-to",
+            post(rollback_to),
         )
         .with_state(state.clone())
 }

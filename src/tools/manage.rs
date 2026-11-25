@@ -4,6 +4,7 @@ use super::{
     Ctx,
     args::{boolean, identifier, integer, optional_text, server, text, to_map},
     output::request,
+    rollback::{self, RollbackCapture, Snapshot},
 };
 use axum::http::Method;
 use serde_json::{Map, Value, json};
@@ -117,7 +118,10 @@ pub async fn list_schedules(ctx: &Ctx, args: &Map<String, Value>) -> Result<Stri
     .await
 }
 
-pub async fn create_schedule(ctx: &Ctx, args: &Map<String, Value>) -> Result<String, String> {
+pub async fn create_schedule(
+    ctx: &Ctx,
+    args: &Map<String, Value>,
+) -> Result<(String, RollbackCapture), String> {
     let server = server(args)?;
     let name = text(args, "name")?;
     let enabled = match args.get("enabled") {
@@ -192,13 +196,25 @@ Fix the step and add it with write_api (POST /api/client/servers/{server}/schedu
         }
     }
 
-    Ok(format!(
-        "Created schedule \"{name}\" ({schedule}) on server {server} with {} trigger{} and {} step{}{}.",
-        triggers.len(),
-        if triggers.len() == 1 { "" } else { "s" },
-        steps.len(),
-        if steps.len() == 1 { "" } else { "s" },
-        if enabled { "" } else { ", disabled" }
+    let capture = RollbackCapture::Available {
+        summary: format!("Delete created schedule \"{name}\" ({schedule})"),
+        snapshot: Snapshot::CreateSchedule {
+            server: server.to_string(),
+            schedule_uuid: schedule.clone(),
+            name: name.to_string(),
+        },
+    };
+
+    Ok((
+        format!(
+            "Created schedule \"{name}\" ({schedule}) on server {server} with {} trigger{} and {} step{}{}.",
+            triggers.len(),
+            if triggers.len() == 1 { "" } else { "s" },
+            steps.len(),
+            if steps.len() == 1 { "" } else { "s" },
+            if enabled { "" } else { ", disabled" }
+        ),
+        capture,
     ))
 }
 
@@ -230,7 +246,10 @@ pub async fn list_variables(ctx: &Ctx, args: &Map<String, Value>) -> Result<Stri
     .await
 }
 
-pub async fn update_variables(ctx: &Ctx, args: &Map<String, Value>) -> Result<String, String> {
+pub async fn update_variables(
+    ctx: &Ctx,
+    args: &Map<String, Value>,
+) -> Result<(String, RollbackCapture), String> {
     let server = server(args)?;
     let Some(Value::Object(values)) = args.get("variables") else {
         return Err(
@@ -242,6 +261,7 @@ pub async fn update_variables(ctx: &Ctx, args: &Map<String, Value>) -> Result<St
         return Err("`variables` must name at least one variable".into());
     }
 
+    let mut updates = Vec::with_capacity(values.len());
     let mut variables = Vec::with_capacity(values.len());
     for (name, value) in values {
         let value = match value {
@@ -250,8 +270,11 @@ pub async fn update_variables(ctx: &Ctx, args: &Map<String, Value>) -> Result<St
             Value::Bool(flag) => flag.to_string(),
             _ => return Err(format!("The value of {name} must be a string, number or boolean")),
         };
+        updates.push((name.clone(), value.clone()));
         variables.push(json!({ "env_variable": name, "value": value }));
     }
+
+    let capture = rollback::capture_startup_variables(ctx, server, &updates).await;
 
     request(
         ctx,
@@ -262,8 +285,11 @@ pub async fn update_variables(ctx: &Ctx, args: &Map<String, Value>) -> Result<St
     )
     .await?;
     let names: Vec<&str> = values.keys().map(String::as_str).collect();
-    Ok(format!(
-        "Updated {} on server {server}. Restart the server for the new values to take effect.",
-        names.join(", ")
+    Ok((
+        format!(
+            "Updated {} on server {server}. Restart the server for the new values to take effect.",
+            names.join(", ")
+        ),
+        capture,
     ))
 }

@@ -6,9 +6,13 @@ import {
   type ChatState,
   callView,
   canContinue,
+  canRollback,
   emptyChat,
   type Message,
   pendingActions,
+  rollbackableToAction,
+  upsertAction,
+  upsertActions,
   withMessage,
 } from '../frontend/src/lib/chat.ts';
 
@@ -23,17 +27,27 @@ function message(id: number, entry: Message['entry']): Message {
   return { id, entry, created: '2026-11-20T20:00:00Z' };
 }
 
-const action: Action = {
-  uuid: 'a1',
-  call_id: 'c2',
-  tool: 'power_server',
-  title: 'Start, stop, restart or kill the server',
-  arguments: { action: 'restart' },
-  status: 'pending',
-  result: null,
-  created: '2026-11-20T20:00:01Z',
-  decided: null,
-};
+function makeAction(overrides: Partial<Action> = {}): Action {
+  return {
+    uuid: 'a1',
+    seq: 1,
+    call_id: 'c2',
+    tool: 'power_server',
+    title: 'Start, stop, restart or kill the server',
+    arguments: { action: 'restart' },
+    status: 'pending',
+    result: null,
+    created: '2026-11-20T20:00:01Z',
+    decided: null,
+    rollback_status: 'unavailable',
+    rollback_summary: null,
+    rollback_result: null,
+    rolled_back: null,
+    ...overrides,
+  };
+}
+
+const action: Action = makeAction();
 
 function play(events: { event: string; data: string }[]): ChatState {
   return events.reduce(applyEvent, { ...emptyChat, busy: true });
@@ -100,4 +114,61 @@ test('errors are kept and broken events are ignored', () => {
   ]);
   assert.equal(state.error, 'The AI provider answered HTTP 401: invalid x-api-key');
   assert.equal(state.draft, '');
+});
+
+test('upsertAction and upsertActions keep actions ordered by seq', () => {
+  const a3 = makeAction({ uuid: 'a3', seq: 3, status: 'succeeded', rollback_status: 'available' });
+  const a1 = makeAction({ uuid: 'a1', seq: 1, status: 'succeeded', rollback_status: 'available' });
+  const a2 = makeAction({ uuid: 'a2', seq: 2, status: 'succeeded', rollback_status: 'available' });
+
+  let list = upsertAction([], a3);
+  list = upsertAction(list, a1);
+  assert.deepEqual(
+    list.map((item) => item.uuid),
+    ['a1', 'a3'],
+  );
+
+  const a1Rolled = { ...a1, rollback_status: 'rolled_back' as const, rollback_result: 'Restored.' };
+  list = upsertActions(list, [a2, a1Rolled]);
+  assert.deepEqual(
+    list.map((item) => item.uuid),
+    ['a1', 'a2', 'a3'],
+  );
+  assert.equal(list[0].rollback_status, 'rolled_back');
+  assert.equal(list[0].rollback_result, 'Restored.');
+});
+
+test('canRollback and rollbackableToAction plan checkpoint rollbacks in reverse seq order', () => {
+  const a1 = makeAction({ uuid: 'a1', seq: 1, tool: 'edit_file', status: 'succeeded', rollback_status: 'available' });
+  const a2 = makeAction({ uuid: 'a2', seq: 2, tool: 'power_server', status: 'succeeded', rollback_status: 'unavailable' });
+  const a3 = makeAction({ uuid: 'a3', seq: 3, tool: 'write_file', status: 'succeeded', rollback_status: 'failed' });
+  const a4 = makeAction({ uuid: 'a4', seq: 4, tool: 'rename_server', status: 'succeeded', rollback_status: 'rolled_back' });
+  const a5 = makeAction({ uuid: 'a5', seq: 5, tool: 'edit_file', status: 'failed', rollback_status: 'unavailable' });
+  const a6 = makeAction({ uuid: 'a6', seq: 6, tool: 'create_schedule', status: 'succeeded', rollback_status: 'available' });
+  const actions = [a1, a2, a3, a4, a5, a6];
+
+  assert.equal(canRollback(a1), true);
+  assert.equal(canRollback(a2), false);
+  assert.equal(canRollback(a3), true, 'failed rollbacks can be retried');
+  assert.equal(canRollback(a4), false);
+  assert.equal(canRollback(a5), false);
+
+  const plan = rollbackableToAction(actions, 'a1');
+  assert.deepEqual(
+    plan.reversible.map((item) => item.uuid),
+    ['a6', 'a3', 'a1'],
+  );
+  assert.deepEqual(
+    plan.irreversible.map((item) => item.uuid),
+    ['a2'],
+  );
+
+  const latestPlan = rollbackableToAction(actions, 'a6');
+  assert.deepEqual(
+    latestPlan.reversible.map((item) => item.uuid),
+    ['a6'],
+  );
+  assert.deepEqual(latestPlan.irreversible, []);
+
+  assert.deepEqual(rollbackableToAction(actions, 'missing'), { reversible: [], irreversible: [] });
 });

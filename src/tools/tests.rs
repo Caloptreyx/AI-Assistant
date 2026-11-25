@@ -237,16 +237,17 @@ async fn tools_without_permission_are_refused_before_any_request() {
         _ => panic!("read_console ran without control.read-console"),
     }
 
-    let err = run_confirmed(
+    let (outcome, capture) = run_confirmed(
         panel.clone(),
         &server_scope(),
         &nothing,
         "power_server",
         &sample_arguments("power_server"),
     )
-    .await
-    .unwrap_err();
+    .await;
+    let err = outcome.unwrap_err();
     assert!(err.contains("not available"), "{err}");
+    assert_eq!(capture, RollbackCapture::none());
 
     // Admin tools do not exist in a server chat, whatever the user may do elsewhere.
     let admin = Grants::admin(&["users.read"]);
@@ -312,7 +313,7 @@ async fn renaming_keeps_the_current_description() {
     // on the dev panel, and sending null would erase it.
     let panel = Panel::new(200);
     let grants = Grants::server(&["settings.rename"]);
-    let result = run_confirmed(
+    let (result, _) = run_confirmed(
         panel.clone(),
         &server_scope(),
         &grants,
@@ -333,7 +334,7 @@ async fn renaming_keeps_the_current_description() {
         vec![json!({ "name": "Survival Two", "description": "Kept" })]
     );
 
-    // An empty description removes it, without looking up the current one.
+    // An empty description removes it.
     let panel = Panel::new(200);
     run_confirmed(
         panel.clone(),
@@ -343,6 +344,7 @@ async fn renaming_keeps_the_current_description() {
         &json!({ "description": "" }),
     )
     .await
+    .0
     .unwrap();
     assert_eq!(panel.bodies(), vec![json!({ "description": null })]);
 }
@@ -350,7 +352,7 @@ async fn renaming_keeps_the_current_description() {
 #[tokio::test]
 async fn confirmed_changes_reach_the_panel() {
     let panel = Panel::new(200);
-    let result = run_confirmed(
+    let (result, capture) = run_confirmed(
         panel.clone(),
         &server_scope(),
         &Grants::server(&["control.restart"]),
@@ -359,6 +361,7 @@ async fn confirmed_changes_reach_the_panel() {
     )
     .await;
     assert!(result.is_ok(), "{result:?}");
+    assert_eq!(capture, RollbackCapture::none());
     assert_eq!(
         panel.calls(),
         vec![(Method::POST, format!("/api/client/servers/{SERVER}/power"))]
@@ -382,7 +385,7 @@ async fn a_server_chat_only_ever_reaches_its_own_server() {
         Unconfirmed::Ran(Ok(text)) => assert!(text.contains("players online"), "{text}"),
         _ => panic!("read_console failed"),
     }
-    let result = run_confirmed(
+    let (result, _) = run_confirmed(
         panel.clone(),
         &server_scope(),
         &grants,

@@ -2,6 +2,7 @@ use super::{
     Ctx,
     args::{boolean, integer, optional_text, server, text, to_map},
     output::{request, request_json, strip_ansi, tail, truncate},
+    rollback::{self, RollbackCapture, Snapshot},
 };
 use crate::proxy;
 use axum::http::Method;
@@ -71,7 +72,10 @@ pub async fn get(ctx: &Ctx, args: &Map<String, Value>) -> Result<String, String>
     Ok(truncate(Value::Object(combined).to_string()))
 }
 
-pub async fn rename(ctx: &Ctx, args: &Map<String, Value>) -> Result<String, String> {
+pub async fn rename(
+    ctx: &Ctx,
+    args: &Map<String, Value>,
+) -> Result<(String, RollbackCapture), String> {
     let server = server(args)?;
     let name = optional_text(args, "name")?
         .map(str::trim)
@@ -87,22 +91,52 @@ pub async fn rename(ctx: &Ctx, args: &Map<String, Value>) -> Result<String, Stri
         return Err("`description` must be at most 1024 characters".into());
     }
 
+    let current = request_json(
+        ctx,
+        Method::GET,
+        &format!("/api/client/servers/{server}"),
+        None,
+        None,
+    )
+    .await;
+
+    let current_json = match current {
+        Ok((_, json)) => json,
+        Err(err) if description.is_none() => return Err(err),
+        Err(_) => None,
+    };
+
+    let previous_name = current_json
+        .as_ref()
+        .and_then(|v| v.pointer("/server/name"))
+        .and_then(Value::as_str)
+        .map(str::to_string);
+    let previous_description = current_json
+        .as_ref()
+        .and_then(|v| v.pointer("/server/description"))
+        .and_then(Value::as_str)
+        .filter(|d| !d.is_empty())
+        .map(str::to_string);
+
     let mut body = Map::new();
     if let Some(name) = name {
         body.insert("name".into(), json!(name));
     }
     // The panel requires `description` in every rename (null removes it), so the current one is
     // sent again when only the name changes.
-    let description = match description {
-        Some("") => Value::Null,
-        Some(description) => json!(description),
-        None => request_json(ctx, Method::GET, &format!("/api/client/servers/{server}"), None, None)
-            .await?
-            .1
-            .and_then(|current| current.pointer("/server/description").cloned())
-            .unwrap_or(Value::Null),
+    let post_description = match description {
+        Some("") => None,
+        Some(description) => Some(description.to_string()),
+        None => previous_description.clone(),
     };
-    body.insert("description".into(), description);
+    body.insert(
+        "description".into(),
+        match &post_description {
+            Some(desc) => json!(desc),
+            None => Value::Null,
+        },
+    );
+
     request(
         ctx,
         Method::POST,
@@ -111,7 +145,31 @@ pub async fn rename(ctx: &Ctx, args: &Map<String, Value>) -> Result<String, Stri
         Some(&Value::Object(body)),
     )
     .await?;
-    Ok(format!("Updated the name/description of server {server}."))
+
+    let capture = match previous_name {
+        Some(prev_name) => {
+            let post_name = name.map(str::to_string).unwrap_or_else(|| prev_name.clone());
+            let summary = rollback::rename_summary(&prev_name, previous_description.as_deref());
+            RollbackCapture::Available {
+                summary,
+                snapshot: Snapshot::RenameServer {
+                    server: server.to_string(),
+                    previous_name: prev_name,
+                    previous_description,
+                    post_name,
+                    post_description,
+                },
+            }
+        }
+        None => RollbackCapture::unavailable(
+            "Could not read previous server name before renaming.",
+        ),
+    };
+
+    Ok((
+        format!("Updated the name/description of server {server}."),
+        capture,
+    ))
 }
 
 pub async fn power(ctx: &Ctx, args: &Map<String, Value>) -> Result<String, String> {
